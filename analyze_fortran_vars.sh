@@ -1,17 +1,19 @@
 #!/bin/bash
 # analyze_fortran_vars.sh - Wrapper script for Fortran variable analysis
+# This script can be used when the package is not installed via pip
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="$SCRIPT_DIR/fortran_variable_analyzer.py"
 
-# Default values
-MOD_PARAMETERS="mod_parameters.f90"
-OUTPUT_FILE=""
-VERBOSE=""
-SHOW_ALL_GLOBALS=""
-ENHANCED=""
-TRUNCATE=""
-DEBUG=""
+# Try to use pip-installed version first, fall back to local
+if command -v fortran-analyzer &> /dev/null; then
+    PYTHON_CMD="fortran-analyzer"
+elif [ -f "$SCRIPT_DIR/fortran_analyzer/analyzer.py" ]; then
+    PYTHON_CMD="python3 -m fortran_analyzer"
+    export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+else
+    echo "Error: fortran-analyzer not found. Please install with 'pip install .' or run from source directory"
+    exit 1
+fi
 
 # Help function
 show_help() {
@@ -19,6 +21,9 @@ show_help() {
 Usage: $0 [OPTIONS] fortran_files...
 
 Analyze Fortran source files for variable sources and dependencies
+
+This is a wrapper script. For direct usage after pip installation, use:
+    fortran-analyzer [OPTIONS] fortran_files...
 
 OPTIONS:
     -h, --help              Show this help message
@@ -45,109 +50,40 @@ EXAMPLES:
     
     # Save report to file with all globals shown
     $0 -a -o analysis_report.txt src/*.f90
-    
-    # Use with find to analyze all Fortran files
-    find . -name "*.f90" -o -name "*.f" | xargs $0
 
-PATTERNS DETECTED:
-    - Parameter declarations (constants)
-    - Variable assignments from reads, calculations, literals
-    - Array and derived type assignments  
-    - Command line argument reads
-    - USE statement imports
-    - Cross-references with global variables
-    - Procedure-level variable analysis
+INSTALLATION:
+    # Install via pip (recommended)
+    pip install .
+    
+    # Then use directly:
+    fortran-analyzer [OPTIONS] files...
 
 HELP_EOF
 }
 
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -m|--mod-parameters)
-            MOD_PARAMETERS="$2"
-            shift 2
-            ;;
-        -o|--output)
-            OUTPUT_FILE="$2"
-            shift 2
-            ;;
-        -v|--verbose)
-            VERBOSE="-v"
-            shift
-            ;;
-        -a|--show-all-globals)
-            SHOW_ALL_GLOBALS="--show-all-globals"
-            shift
-            ;;
-        -e|--enhanced)
-            ENHANCED="--enhanced"
-            shift
-            ;;
-        -t|--truncate)
-            TRUNCATE="--truncate"
-            shift
-            ;;
-        --debug)
-            DEBUG="--debug"
-            shift
-            ;;
-        -*)
-            echo "Unknown option: $1"
-            show_help
-            exit 1
-            ;;
-        *)
-            break
-            ;;
-    esac
+# Check for help flag first
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+        exit 0
+    fi
 done
 
-# Check if we have input files
-if [[ $# -eq 0 ]]; then
+# Check if we have input files (look for non-option arguments)
+has_files=false
+for arg in "$@"; do
+    if [[ ! "$arg" =~ ^- ]]; then
+        has_files=true
+        break
+    fi
+done
+
+if ! $has_files; then
     echo "Error: No input files specified"
     show_help
     exit 1
 fi
 
-# Build command
-CMD="python3 $PYTHON_SCRIPT"
-
-if [[ -n "$MOD_PARAMETERS" ]]; then
-    CMD="$CMD --mod-parameters $MOD_PARAMETERS"
-fi
-
-if [[ -n "$OUTPUT_FILE" ]]; then
-    CMD="$CMD --output $OUTPUT_FILE"
-fi
-
-if [[ -n "$VERBOSE" ]]; then
-    CMD="$CMD $VERBOSE"
-fi
-
-if [[ -n "$SHOW_ALL_GLOBALS" ]]; then
-    CMD="$CMD $SHOW_ALL_GLOBALS"
-fi
-
-if [[ -n "$ENHANCED" ]]; then
-    CMD="$CMD $ENHANCED"
-fi
-
-if [[ -n "$TRUNCATE" ]]; then
-    CMD="$CMD $TRUNCATE"
-fi
-
-if [[ -n "$DEBUG" ]]; then
-    CMD="$CMD $DEBUG"
-fi
-
-# Add input files
-CMD="$CMD $@"
-
 # Run the analysis
 echo "Running Fortran variable analysis..."
-eval $CMD
+$PYTHON_CMD "$@"

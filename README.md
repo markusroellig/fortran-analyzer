@@ -12,6 +12,20 @@ A comprehensive tool for analyzing Fortran source code to identify variable sour
 
 ## Installation
 
+### Via pip (recommended)
+
+```bash
+# Install from source
+git clone <repository-url>
+cd fortran-analyzer
+pip install .
+
+# Or install in development mode
+pip install -e .
+```
+
+### Manual installation
+
 ```bash
 git clone <repository-url>
 cd fortran-analyzer
@@ -20,24 +34,30 @@ chmod +x analyze_fortran_vars.sh
 
 ## Usage
 
-### Basic Analysis
-```bash
-./analyze_fortran_vars.sh input_file.f90
-```
+### Command line (after pip installation)
 
-### Advanced Options
 ```bash
-# Analyze with custom mod_parameters file
-./analyze_fortran_vars.sh -m path/to/mod_parameters.f90 *.f90
+# Basic analysis
+fortran-analyzer input_file.f90
+
+# With custom mod_parameters file
+fortran-analyzer -m path/to/mod_parameters.f90 *.f90
 
 # Save output to file with all global variables shown
-./analyze_fortran_vars.sh -a -o analysis_report.txt *.f90
+fortran-analyzer -a -o analysis_report.txt *.f90
 
 # Truncate output for large files
-./analyze_fortran_vars.sh --truncate large_file.f90
+fortran-analyzer --truncate large_file.f90
 
 # Enable debug mode
-./analyze_fortran_vars.sh --debug problematic_file.f90
+fortran-analyzer --debug problematic_file.f90
+```
+
+### Via wrapper script
+
+```bash
+# Use the wrapper script (works with or without pip installation)
+./analyze_fortran_vars.sh input_file.f90
 ```
 
 ## Command Line Options
@@ -51,26 +71,35 @@ chmod +x analyze_fortran_vars.sh
 - `-t, --truncate`: Truncate long lists
 - `--debug`: Enable debug mode
 
-## Output Analysis
-
-The tool provides:
-
-1. **Global Variables Summary**: Shows all variables from mod_parameters.f90
-2. **File-level Analysis**: USE statements and module-level variables
-3. **Procedure Analysis**: Individual analysis for each subroutine/function
-4. **Cross-reference Analysis**: Global variable usage patterns
-
 ## Development
 
 ### Requirements
 - Python 3.6+
-- Bash shell
+
+### Development Installation
+```bash
+# Install in development mode with dev dependencies
+./install_dev.sh
+
+# Or manually:
+pip install -e ".[dev]"
+```
 
 ### Running Tests
 ```bash
-# Run tests (when implemented)
 python -m pytest tests/
 ```
+
+### Code Formatting
+```bash
+black fortran_analyzer/
+flake8 fortran_analyzer/
+mypy fortran_analyzer/
+```
+
+## Examples
+
+See the `examples/` directory for sample Fortran files and usage examples.
 
 ## Contributing
 
@@ -78,7 +107,8 @@ python -m pytest tests/
 2. Create a feature branch
 3. Make your changes
 4. Add tests if applicable
-5. Submit a pull request
+5. Run the test suite
+6. Submit a pull request
 
 ## License
 
