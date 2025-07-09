@@ -642,6 +642,9 @@ class FortranVariableAnalyzer:
             add_line(f"FILE ANALYSIS: {Path(filename).name}")
             add_line("=" * 80)
 
+            # Generate and add the high-level summary for the file
+            self._generate_file_summary(filename, add_line)
+
             # File-level USE statements
             if filename in self.use_statements:
                 add_line("FILE-LEVEL USE Statements:", 1)
@@ -748,6 +751,29 @@ class FortranVariableAnalyzer:
                                     add_line(f"  {var_name:<18}: {count:3d} reads [{scope_status}]", 3)
                                 add_line()
 
+                        # Global variable usage within the procedure
+                        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
+
+                        # Globals Read in this procedure
+                        proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
+                        read_globals_in_proc = {var_name.lower() for var_name, _, _ in proc_reads if var_name.lower() in global_var_names_lower}
+                        
+                        if read_globals_in_proc:
+                            add_line("Global Variables Read:", 2)
+                            for var in sorted(list(read_globals_in_proc)):
+                                add_line(var, 3)
+                            add_line()
+
+                        # Globals Modified in this procedure
+                        proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
+                        modified_globals_in_proc = {assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}
+
+                        if modified_globals_in_proc:
+                            add_line("Global Variables Modified:", 2)
+                            for var in sorted(list(modified_globals_in_proc)):
+                                add_line(var, 3)
+                            add_line()
+
                         add_line()
 
             add_line()
@@ -764,9 +790,66 @@ class FortranVariableAnalyzer:
         else:
             print(report_text)
 
+    def _generate_file_summary(self, filename: str, add_line):
+        """Generate a high-level summary for a single file."""
+        procedures = self.file_procedures.get(filename, [])
+        if not procedures:
+            return
+
+        global_reads_count = defaultdict(int)
+        global_writes_count = defaultdict(int)
+        proc_global_write_counts = []
+        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
+
+        for proc in procedures:
+            # Aggregate global reads
+            proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
+            for var_name, _, _ in proc_reads:
+                if var_name.lower() in global_var_names_lower:
+                    global_reads_count[var_name.lower()] += 1
+
+            # Aggregate global writes and count per-procedure modifications
+            proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
+            modified_globals_in_proc = {assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}
+            
+            if modified_globals_in_proc:
+                proc_global_write_counts.append((proc.name, len(modified_globals_in_proc)))
+                for var_name in modified_globals_in_proc:
+                    global_writes_count[var_name] += 1
+
+        sorted_global_reads = sorted(global_reads_count.items(), key=lambda item: item[1], reverse=True)
+        sorted_global_writes = sorted(global_writes_count.items(), key=lambda item: item[1], reverse=True)
+        sorted_hotspots = sorted(proc_global_write_counts, key=lambda item: item[1], reverse=True)
+
+        add_line("High-Level Summary", 1)
+        add_line("------------------", 1)
+        add_line(f"Total Procedures: {len(procedures)}", 2)
+        add_line()
+
+        if sorted_hotspots:
+            add_line("Top Global Variable Modifiers (Hotspots):", 2)
+            for proc_name, count in sorted_hotspots[:5]:
+                add_line(f"{proc_name:<30}: Modifies {count} global variables", 3)
+            add_line()
+
+        if sorted_global_writes:
+            add_line("Most Frequently Modified Global Variables:", 2)
+            for var_name, count in sorted_global_writes[:5]:
+                add_line(f"{var_name:<30}: Modified in {count} procedure(s)", 3)
+            add_line()
+
+        if sorted_global_reads:
+            add_line("Most Frequently Read Global Variables:", 2)
+            for var_name, count in sorted_global_reads[:5]:
+                add_line(f"{var_name:<30}: Read {count} time(s)", 3)
+            add_line()
+        
+        add_line("-" * 80)
+        add_line()
+
     def _generate_global_summary(self, add_line, show_all_globals: bool):
         """Generate global variables summary"""
-        add_line("GLOBAL VARIABLES SUMMARY (from mod_parameters.f90)")
+        add_line("GLOBAL VARIABLES SUMMARY")
         add_line("-" * 50)
         add_line(f"Total modules found: {len(self.modules)}")
         add_line(f"Total global variables: {len(self.global_variables)}")
