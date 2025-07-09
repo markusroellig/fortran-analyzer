@@ -679,9 +679,8 @@ class FortranVariableAnalyzer:
                 add_line("FILE-LEVEL Variable Declarations:", 1)
                 for var_info in self.file_variables[filename][:15]:
                     scope_status = self.classify_variable_scope(var_info.name, filename)
-                    param_str = " [PARAM]" if var_info.is_parameter else ""
-                    dims_str = f" {var_info.dimensions}" if var_info.dimensions else ""
-                    add_line(f"Line {var_info.line_num:4d}: {var_info.name:<20} {var_info.type:<15}{dims_str} [{scope_status}]{param_str}", 2)
+                    line_str = self._format_variable_line(var_info, scope_status)
+                    add_line(line_str, 2)
 
                 if len(self.file_variables[filename]) > 15:
                     add_line(f"  ... and {len(self.file_variables[filename]) - 15} more declarations", 2)
@@ -695,8 +694,9 @@ class FortranVariableAnalyzer:
                     add_line()
 
                     for proc in procedures:
-                        add_line(f"{proc.type.upper()}: {proc.name} (lines {proc.start_line}-{proc.end_line})", 1)
-                        add_line("-" * 60, 1)
+                        proc_header = f"{proc.type.upper()}: {proc.name} (lines {proc.start_line}-{proc.end_line})"
+                        add_line(proc_header, 1)
+                        add_line("-" * len(proc_header), 1)
 
                         if proc.module:
                             add_line(f"Module: {proc.module}", 2)
@@ -722,9 +722,8 @@ class FortranVariableAnalyzer:
                                 add_line("Local Variable Declarations:", 2)
                                 for var_info in vars_list[:15]:
                                     scope_status = self.classify_variable_scope(var_info.name, filename)
-                                    param_str = " [PARAM]" if var_info.is_parameter else ""
-                                    dims_str = f" {var_info.dimensions}" if var_info.dimensions else ""
-                                    add_line(f"Line {var_info.line_num:4d}: {var_info.name:<18} {var_info.type:<12}{dims_str} [{scope_status}]{param_str}", 3)
+                                    line_str = self._format_variable_line(var_info, scope_status)
+                                    add_line(line_str, 3)
 
                                 if len(vars_list) > 15:
                                     add_line(f"  ... and {len(vars_list) - 15} more declarations", 3)
@@ -809,6 +808,25 @@ class FortranVariableAnalyzer:
         else:
             print(report_text)
 
+    def _format_variable_line(self, var_info: VariableInfo, scope_or_usage: str) -> str:
+        """Formats a single line for a variable declaration with consistent padding."""
+        line_prefix = f"Line {var_info.line_num:4d}:"
+        name_str = f"{var_info.name:<20}"
+        type_str = f"{var_info.type:<15}"
+        
+        # Combine dimensions and attributes
+        attributes = []
+        if var_info.dimensions:
+            attributes.append(var_info.dimensions)
+        if var_info.is_parameter:
+            attributes.append("[PARAM]")
+        if var_info.is_allocatable:
+            attributes.append("[ALLOCATABLE]")
+        
+        attr_str = ' '.join(attributes)
+        
+        return f"{line_prefix} {name_str} {type_str} {attr_str:<25} [{scope_or_usage}]"
+
     def _generate_file_summary(self, filename: str, add_line):
         """Generate a high-level summary for a single file."""
         procedures = self.file_procedures.get(filename, [])
@@ -892,19 +910,14 @@ class FortranVariableAnalyzer:
             for var_name in display_vars:
                 if var_name in self.global_variables:
                     var_info = self.global_variables[var_name]
-                    param_str = " [PARAMETER]" if var_info.is_parameter else ""
-                    alloc_str = " [ALLOCATABLE]" if var_info.is_allocatable else ""
-                    dims_str = f" {var_info.dimensions}" if var_info.dimensions else ""
-
-                    # Check if variable is used in any analyzed file
                     usage_status = self._check_global_variable_usage(var_name)
+                    line_str = self._format_variable_line(var_info, usage_status)
+                    add_line(line_str, 1)
 
                     if "USED" in usage_status:
                         used_count += 1
                     if "MODIFIED" in usage_status:
                         modified_count += 1
-
-                    add_line(f"  {var_info.name:<20} {var_info.type:<15}{dims_str}{param_str}{alloc_str} [{usage_status}]", 1)
 
             if not show_all_globals and len(variables) > 10:
                 add_line(f"  ... and {len(variables) - 10} more variables (use --show-all-globals to see all)", 1)
