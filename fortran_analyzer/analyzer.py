@@ -381,12 +381,11 @@ class FortranVariableAnalyzer:
         line_lower = line_clean.lower()
         result = []
 
-        # Skip certain lines
+        # Skip certain lines that are definitely not declarations
         if (line_lower.startswith('implicit') or line_lower.startswith('save') or
             line_lower.startswith('contains') or line_lower.startswith('use') or
             line_lower.startswith('private') or line_lower.startswith('public') or
-            line_lower.startswith('procedure') or line_lower.startswith('class') or
-            '::' not in line_clean):
+            line_lower.startswith('procedure') or line_lower.startswith('class')):
             return result
 
         try:
@@ -437,6 +436,45 @@ class FortranVariableAnalyzer:
                                     module=module,
                                     line_num=line_num
                                 ))
+            # F77-style declaration: type variable_list
+            else:
+                f77_type_pattern = r'^\s*(integer|real|double\s+precision|complex|logical|character(?:\s*\*[\s\d\w\(\)]+)?)\s+(.*)'
+                match = re.match(f77_type_pattern, line_clean, re.IGNORECASE)
+                if match:
+                    type_part = match.group(1)
+                    var_part = match.group(2)
+
+                    # Avoid misinterpreting a function definition as a variable declaration
+                    if re.match(r'^\s*function\b', var_part, re.IGNORECASE):
+                        return result
+
+                    type_part_lower = type_part.lower()
+                    kind = ''
+                    var_type = ''
+
+                    if type_part_lower.startswith('character'):
+                        var_type = 'character'
+                        kind_match = re.search(r'(\*.*)', type_part, re.IGNORECASE)
+                        if kind_match:
+                            kind = kind_match.group(1).strip()
+                    elif type_part_lower.startswith('double'):
+                        var_type = 'double_precision'
+                    else:
+                        type_match = re.match(r'(\w+)', type_part_lower)
+                        var_type = type_match.group(1)
+                        kind_match = re.search(r'\*(\s*\d+)', type_part_lower)
+                        if kind_match:
+                            kind = kind_match.group(1).strip()
+                    
+                    variables = self.parse_variable_list(var_part)
+                    for var_name, dimensions, initial_value in variables:
+                        if var_name:
+                            result.append(VariableInfo(
+                                name=var_name, type=var_type, kind=kind,
+                                dimensions=dimensions, is_parameter=False,
+                                is_allocatable=False, initial_value=initial_value,
+                                module=module, line_num=line_num
+                            ))
 
         except Exception as e:
             # If parsing fails, just skip this line
