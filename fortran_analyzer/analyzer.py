@@ -693,7 +693,11 @@ class FortranVariableAnalyzer:
                     add_line(f"PROCEDURES FOUND: {len(procedures)}", 1)
                     add_line()
 
-                    for proc in procedures:
+                    for i, proc in enumerate(procedures):
+                        if i > 0:
+                            add_line("=" * 80, 1)
+                            add_line()
+                            
                         proc_header = f"{proc.type.upper()}: {proc.name} (lines {proc.start_line}-{proc.end_line})"
                         add_line(proc_header, 1)
                         add_line("-" * len(proc_header), 1)
@@ -766,7 +770,7 @@ class FortranVariableAnalyzer:
                                 sorted_reads = sorted(read_counts.items(), key=lambda x: x[1], reverse=True)
                                 for var_name, count in sorted_reads[:12]:
                                     scope_status = self.classify_variable_scope(var_name, filename)
-                                    add_line(f"  {var_name:<18}: {count:3d} reads [{scope_status}]", 3)
+                                    add_line(f"{var_name:<20}: {count:3d} reads [{scope_status}]", 3)
                                 add_line()
 
                         # Global variable usage within the procedure
@@ -774,22 +778,22 @@ class FortranVariableAnalyzer:
 
                         # Globals Read in this procedure
                         proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
-                        read_globals_in_proc = {var_name.lower() for var_name, _, _ in proc_reads if var_name.lower() in global_var_names_lower}
+                        read_globals_in_proc = sorted(list({var_name.lower() for var_name, _, _ in proc_reads if var_name.lower() in global_var_names_lower}))
                         
                         if read_globals_in_proc:
                             add_line("Global Variables Read:", 2)
-                            for var in sorted(list(read_globals_in_proc)):
-                                add_line(var, 3)
+                            for line in self._format_list_in_columns(read_globals_in_proc):
+                                add_line(line, 3)
                             add_line()
 
                         # Globals Modified in this procedure
                         proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
-                        modified_globals_in_proc = {assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}
+                        modified_globals_in_proc = sorted(list({assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}))
 
                         if modified_globals_in_proc:
                             add_line("Global Variables Modified:", 2)
-                            for var in sorted(list(modified_globals_in_proc)):
-                                add_line(var, 3)
+                            for line in self._format_list_in_columns(modified_globals_in_proc):
+                                add_line(line, 3)
                             add_line()
 
                         add_line()
@@ -807,6 +811,30 @@ class FortranVariableAnalyzer:
             print(f"Report written to {output_file}")
         else:
             print(report_text)
+
+    def _format_list_in_columns(self, items: List[str], num_columns: int = 4, col_width: int = 22) -> List[str]:
+        """Formats a list of strings into a multi-column layout."""
+        if not items:
+            return []
+
+        # Pad list to be a multiple of num_columns for even distribution
+        padded_items = items + [""] * ((num_columns - len(items) % num_columns) % num_columns)
+        num_rows = len(padded_items) // num_columns
+        
+        lines = []
+        for r in range(num_rows):
+            row_items = []
+            for c in range(num_columns):
+                # Get item using column-major order for better balancing
+                item_index = c * num_rows + r
+                if item_index < len(padded_items):
+                    row_items.append(padded_items[item_index])
+            
+            # Format the row
+            line = "".join(f"{item:<{col_width}}" for item in row_items)
+            lines.append(line.rstrip())
+            
+        return lines
 
     def _format_variable_line(self, var_info: VariableInfo, scope_or_usage: str) -> str:
         """Formats a single line for a variable declaration with consistent padding."""
@@ -959,21 +987,21 @@ class FortranVariableAnalyzer:
         global_var_names = {name.lower() for name in self.global_variables.keys()}
 
         add_line("Global variables being modified:", 1)
-        modified_globals = all_assigned_vars.intersection(global_var_names)
-        for var in sorted(modified_globals):
-            add_line(f"  {var}", 2)
+        modified_globals = sorted(list(all_assigned_vars.intersection(global_var_names)))
+        for line in self._format_list_in_columns(modified_globals):
+            add_line(line, 2)
 
         add_line()
         add_line("Global variables being read:", 1)
-        read_globals = all_read_vars.intersection(global_var_names)
-        for var in sorted(read_globals)[:30]:
-            add_line(f"  {var}", 2)
+        read_globals = sorted(list(all_read_vars.intersection(global_var_names)))
+        for line in self._format_list_in_columns(read_globals):
+            add_line(line, 2)
 
         add_line()
         add_line("Variables assigned but not in global scope:", 1)
-        local_assigned = all_assigned_vars - global_var_names
-        for var in sorted(local_assigned)[:30]:
-            add_line(f"  {var}", 2)
+        local_assigned = sorted(list(all_assigned_vars - global_var_names))
+        for line in self._format_list_in_columns(local_assigned):
+            add_line(line, 2)
 
     def classify_variable_scope(self, var_name: str, filename: str) -> str:
         """Enhanced scope classification"""
