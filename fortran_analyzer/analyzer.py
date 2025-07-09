@@ -33,12 +33,32 @@ ProcedureInfo = namedtuple('ProcedureInfo', [
     'name', 'type', 'start_line', 'end_line', 'module', 'arguments', 'calls'
 ])
 
+class Color:
+    """ANSI color codes for terminal output"""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def cprint(text, color, force_color: bool = False, **kwargs):
+    """Prints text in color if stdout is a TTY or color is forced."""
+    if force_color or sys.stdout.isatty():
+        print(f"{color}{text}{Color.ENDC}", **kwargs)
+    else:
+        print(text, **kwargs)
+
 # Copy the entire FortranVariableAnalyzer class here from your original file
 # (The class definition remains the same)
 class FortranVariableAnalyzer:
     def __init__(self):
         self.global_variables = {}
         self.modules = defaultdict(list)
+        self.module_locations = {}
 
         # File-level structures
         self.file_variables = defaultdict(list)
@@ -59,7 +79,7 @@ class FortranVariableAnalyzer:
         Pass 1: A fast scan of all files in a directory to find all module-level
         (global) variables.
         """
-        print(f"Scanning {source_dir} for global variables...")
+        cprint(f"Scanning {source_dir} for global variables...", Color.BOLD)
         fortran_files = []
         extensions = ['*.f90', '*.f', '*.F90', '*.F']
         for ext in extensions:
@@ -73,22 +93,25 @@ class FortranVariableAnalyzer:
                 print(f"Warning: Could not read {file_path} during scan: {e}")
                 continue
             
-            self._discover_globals_in_content(content)
+            self._discover_globals_in_content(content, file_path)
         
-        print(f"Found {len(self.global_variables)} global variables in {len(self.modules)} modules.")
+        cprint(f"Found {len(self.global_variables)} global variables in {len(self.modules)} modules.", Color.GREEN)
 
-    def _discover_globals_in_content(self, content: str):
+    def _discover_globals_in_content(self, content: str, file_path: Path):
         """Helper for scan_directory_for_globals to parse content."""
         current_module = None
         lines = content.split('\n')
         
         line_buffer = ""
-        for line in lines:
+        for line_num, line in enumerate(lines, 1):
             clean_original = self.clean_line(line)
-            line_buffer += clean_original.rstrip(' &')
             
+            # Handle line continuations correctly
             if clean_original.endswith('&'):
+                line_buffer += clean_original[:-1].rstrip() + " "
                 continue
+            else:
+                line_buffer += clean_original
 
             line_clean = line_buffer
             line_buffer = "" # Reset buffer
@@ -100,6 +123,8 @@ class FortranVariableAnalyzer:
             module_match = re.match(r'^\s*module\s+(\w+)', line_lower)
             if module_match and not line_lower.startswith('end module'):
                 current_module = module_match.group(1)
+                if current_module not in self.module_locations:
+                    self.module_locations[current_module] = file_path.name
                 continue
 
             if re.match(r'^\s*end\s+module', line_lower):
@@ -114,7 +139,7 @@ class FortranVariableAnalyzer:
                     current_module = None # Stop parsing this module
                     continue
 
-                var_infos = self.parse_variable_declaration(line_clean, 0, current_module)
+                var_infos = self.parse_variable_declaration(line_clean, line_num, current_module)
                 for var_info in var_infos:
                     if var_info.name not in self.global_variables:
                         self.global_variables[var_info.name] = var_info
@@ -236,6 +261,7 @@ class FortranVariableAnalyzer:
         
         line_buffer = ""
         line_idx = 0
+        start_line_num = 1
         while line_idx < len(lines):
             i = line_idx + 1
             original_line = lines[line_idx]
@@ -244,12 +270,13 @@ class FortranVariableAnalyzer:
             if not line_buffer:
                 start_line_num = i
 
-            # Handle line continuations
+            # Handle line continuations correctly
             clean_original = self.clean_line(original_line)
-            line_buffer += clean_original.rstrip(' &')
-            
             if clean_original.endswith('&'):
+                line_buffer += clean_original[:-1].rstrip() + " "
                 continue
+            else:
+                line_buffer += clean_original
 
             line_clean = line_buffer
             line_buffer = "" # Reset buffer
@@ -275,9 +302,13 @@ class FortranVariableAnalyzer:
             proc_match = re.match(r'^\s*(subroutine|function)\s+(\w+)', line_lower)
             if proc_match:
                 proc_name = proc_match.group(2)
-                # Find the corresponding procedure info
+                # Find the corresponding procedure info. The line number check is removed
+                # because parse_procedures doesn't handle continuations, but the main
+                # loop does, causing a mismatch in start_line_num.
                 for proc in procedures:
-                    if proc.name.lower() == proc_name and proc.start_line == start_line_num:
+                    if proc.name.lower() == proc_name:
+                        # This assumes procedure names are unique within a file, which is a
+                        # reasonable assumption for a first-pass fix.
                         current_procedure = proc
                         break
                 continue
@@ -707,33 +738,59 @@ class FortranVariableAnalyzer:
                     ))
         return calls
 
-    def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False):
+    def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto'):
         """Generate comprehensive analysis report with procedure-level analysis"""
         report_lines = []
+        
+        if color_mode == 'always':
+            use_color = True
+        elif color_mode == 'never':
+            use_color = False
+        else: # auto
+            use_color = sys.stdout.isatty() and output_file is None
 
-        def add_line(line: str = '', indent: int = 0):
-            report_lines.append('  ' * indent + line)
+        def add_line(line: str = '', indent: int = 0, color: Optional[str] = None):
+            if use_color and color:
+                report_lines.append('  ' * indent + f"{color}{line}{Color.ENDC}")
+            else:
+                report_lines.append('  ' * indent + line)
 
-        add_line("FORTRAN VARIABLE SOURCE ANALYSIS REPORT")
-        add_line("=" * 50)
+        add_line("FORTRAN VARIABLE SOURCE ANALYSIS REPORT", color=Color.HEADER)
+        add_line("=" * 50, color=Color.HEADER)
         add_line(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         add_line(f"Working Directory: {Path.cwd()}")
         add_line()
 
+        # --- Pre-computation for enhanced call graph ---
+        proc_to_file_map = {}
+        for fname, procs in self.file_procedures.items():
+            for p in procs:
+                proc_to_file_map[p.name.lower()] = fname
+        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
+        # --- End pre-computation ---
+
+        # Global Hotspot Summary (if enhanced)
+        if enhanced:
+            self._generate_global_hotspot_summary(add_line, use_color)
+
         # Global Variables Summary
-        self._generate_global_summary(add_line, show_all_globals)
+        self._generate_global_summary(add_line, show_all_globals, use_color)
 
         # File-by-file analysis with procedure breakdown
         for filename in sorted(self.file_variables.keys()):
-            add_line(f"FILE ANALYSIS: {Path(filename).name}")
-            add_line("=" * 80)
+            # Filtering logic for --show-only-file
+            if show_only_file and Path(filename).name not in show_only_file:
+                continue
+
+            add_line(f"FILE ANALYSIS: {Path(filename).name}", color=Color.HEADER)
+            add_line("=" * 80, color=Color.HEADER)
 
             # Generate and add the high-level summary for the file
-            self._generate_file_summary(filename, add_line)
+            self._generate_file_summary(filename, add_line, use_color)
 
             # File-level USE statements
             if filename in self.use_statements:
-                add_line("FILE-LEVEL USE Statements:", 1)
+                add_line("FILE-LEVEL USE Statements:", 1, color=Color.BLUE)
                 for module, only_list, line_num in self.use_statements[filename]:
                     add_line(f"Line {line_num:4d}: USE {module}", 2)
                     if only_list != 'all':
@@ -743,31 +800,55 @@ class FortranVariableAnalyzer:
 
             # File-level variable declarations
             if filename in self.file_variables and self.file_variables[filename]:
-                add_line("FILE-LEVEL Variable Declarations:", 1)
-                for var_info in self.file_variables[filename][:15]:
+                add_line("FILE-LEVEL Variable Declarations:", 1, color=Color.BLUE)
+                limit = 15 if truncate_lists else len(self.file_variables[filename])
+                for var_info in self.file_variables[filename][:limit]:
                     scope_status = self.classify_variable_scope(var_info.name, filename)
-                    line_str = self._format_variable_line(var_info, scope_status)
+                    line_str = self._format_variable_line(var_info, scope_status, use_color)
                     add_line(line_str, 2)
 
-                if len(self.file_variables[filename]) > 15:
-                    add_line(f"  ... and {len(self.file_variables[filename]) - 15} more declarations", 2)
+                if truncate_lists and len(self.file_variables[filename]) > 15:
+                    add_line(f"  ... and {len(self.file_variables[filename]) - 15} more declarations", 2, color=Color.CYAN)
                 add_line()
 
             # Procedure-by-procedure analysis
             if filename in self.file_procedures:
                 procedures = self.file_procedures[filename]
                 if procedures:
-                    add_line(f"PROCEDURES FOUND: {len(procedures)}", 1)
+                    add_line(f"PROCEDURES FOUND: {len(procedures)}", 1, color=Color.BLUE)
                     add_line()
 
                     for i, proc in enumerate(procedures):
                         if i > 0:
-                            add_line("=" * 80, 1)
+                            add_line("." * 80, 1, color=Color.CYAN)
                             add_line()
                             
+                        # --- Start of filtering logic for this procedure ---
+
+                        # Global variable usage within the procedure
+                        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
+
+                        # Globals Read in this procedure
+                        proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
+                        read_globals_in_proc = sorted(list({var_name.lower() for var_name, _, _ in proc_reads if var_name.lower() in global_var_names_lower}))
+                        
+                        # Globals Modified in this procedure
+                        proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
+                        modified_globals_in_proc = sorted(list({assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}))
+
+                        # Filtering logic for --hide-ok
+                        if hide_ok and not read_globals_in_proc and not modified_globals_in_proc:
+                            continue # Skip this procedure from the report
+
+                        # Filtering logic for --show-only-proc
+                        if show_only_proc and proc.name.lower() not in [p.lower() for p in show_only_proc]:
+                            continue # Skip this procedure if it's not in the requested list
+                        
+                        # --- End of filtering logic ---
+
                         proc_header = f"{proc.type.upper()}: {proc.name} (lines {proc.start_line}-{proc.end_line})"
-                        add_line(proc_header, 1)
-                        add_line("-" * len(proc_header), 1)
+                        add_line(proc_header, 1, color=Color.GREEN)
+                        add_line("-" * len(proc_header), 1, color=Color.GREEN)
 
                         if proc.module:
                             add_line(f"Module: {proc.module}", 2)
@@ -777,7 +858,7 @@ class FortranVariableAnalyzer:
                         # Procedure-level USE statements
                         if (filename in self.procedure_use_statements and
                             proc.name in self.procedure_use_statements[filename]):
-                            add_line("USE Statements:", 2)
+                            add_line("USE Statements:", 2, color=Color.CYAN)
                             for module, only_list, line_num in self.procedure_use_statements[filename][proc.name]:
                                 add_line(f"Line {line_num:4d}: USE {module}", 3)
                                 if only_list != 'all':
@@ -787,17 +868,18 @@ class FortranVariableAnalyzer:
 
                         # Procedure-level variable declarations
                         if (filename in self.procedure_variables and
-                            proc.name in self.procedure_variables[filename]):
+                            proc.name in self.procedure_variables[filename] and not hide_locals):
                             vars_list = self.procedure_variables[filename][proc.name]
                             if vars_list:
-                                add_line("Local Variable Declarations:", 2)
-                                for var_info in vars_list[:15]:
-                                    scope_status = self.classify_variable_scope(var_info.name, filename)
-                                    line_str = self._format_variable_line(var_info, scope_status)
+                                add_line("Local Variable Declarations:", 2, color=Color.CYAN)
+                                limit = 15 if truncate_lists else len(vars_list)
+                                for var_info in vars_list[:limit]:
+                                    scope_status = self.classify_variable_scope(var_info.name, filename, proc.name)
+                                    line_str = self._format_variable_line(var_info, scope_status, use_color)
                                     add_line(line_str, 3)
 
-                                if len(vars_list) > 15:
-                                    add_line(f"  ... and {len(vars_list) - 15} more declarations", 3)
+                                if truncate_lists and len(vars_list) > 15:
+                                    add_line(f"  ... and {len(vars_list) - 15} more declarations", 3, color=Color.CYAN)
                                 add_line()
 
                         # Procedure-level assignments
@@ -805,21 +887,27 @@ class FortranVariableAnalyzer:
                             proc.name in self.procedure_assignments[filename]):
                             assignments = self.procedure_assignments[filename][proc.name]
                             if assignments:
-                                add_line("Variable Assignments:", 2)
+                                add_line("Variable Assignments:", 2, color=Color.CYAN)
                                 assignment_counts = defaultdict(int)
+                                limit = 15 if truncate_lists else len(assignments)
 
-                                for assignment in assignments[:15]:
+                                for assignment in assignments[:limit]:
                                     assignment_counts[assignment.assignment_type] += 1
-                                    scope_status = self.classify_variable_scope(assignment.variable, filename)
+                                    scope_status = self.classify_variable_scope(assignment.variable, filename, proc.name)
+                                    scope_str = f"[{scope_status}]"
+                                    if use_color:
+                                        scope_color = Color.GREEN if "GLOBAL" in scope_status else Color.ENDC
+                                        scope_str = f"[{scope_color}{scope_status}{Color.ENDC}]"
+
 
                                     rhs_display = assignment.rhs[:30] + "..." if len(assignment.rhs) > 30 else assignment.rhs
-                                    add_line(f"Line {assignment.line_num:4d}: {assignment.variable:<18} = {rhs_display:<33} [{assignment.assignment_type[:12]}] [{scope_status}]", 3)
+                                    add_line(f"Line {assignment.line_num:4d}: {assignment.variable:<18} = {rhs_display:<33} [{assignment.assignment_type[:12]}] {scope_str}", 3)
 
-                                if len(assignments) > 15:
-                                    add_line(f"  ... and {len(assignments) - 15} more assignments", 3)
+                                if truncate_lists and len(assignments) > 15:
+                                    add_line(f"  ... and {len(assignments) - 15} more assignments", 3, color=Color.CYAN)
 
                                 add_line()
-                                add_line("Assignment Type Summary:", 2)
+                                add_line("Assignment Type Summary:", 2, color=Color.CYAN)
                                 for assign_type, count in assignment_counts.items():
                                     add_line(f"  {assign_type:<20}: {count}", 3)
                                 add_line()
@@ -833,11 +921,16 @@ class FortranVariableAnalyzer:
                                 for var_name, line_num, read_type in reads:
                                     read_counts[var_name] += 1
 
-                                add_line("Most Frequently Read Variables:", 2)
+                                add_line("Most Frequently Read Variables:", 2, color=Color.CYAN)
                                 sorted_reads = sorted(read_counts.items(), key=lambda x: x[1], reverse=True)
-                                for var_name, count in sorted_reads[:12]:
-                                    scope_status = self.classify_variable_scope(var_name, filename)
-                                    add_line(f"{var_name:<20}: {count:3d} reads [{scope_status}]", 3)
+                                limit = 12 if truncate_lists else len(sorted_reads)
+                                for var_name, count in sorted_reads[:limit]:
+                                    scope_status = self.classify_variable_scope(var_name, filename, proc.name)
+                                    scope_str = f"[{scope_status}]"
+                                    if use_color:
+                                        scope_color = Color.GREEN if "GLOBAL" in scope_status else Color.ENDC
+                                        scope_str = f"[{scope_color}{scope_status}{Color.ENDC}]"
+                                    add_line(f"{var_name:<20}: {count:3d} reads {scope_str}", 3)
                                 add_line()
 
                         # Procedure-level calls
@@ -845,31 +938,54 @@ class FortranVariableAnalyzer:
                             proc.name in self.procedure_calls[filename]):
                             calls = self.procedure_calls[filename][proc.name]
                             if calls:
-                                add_line("Procedure Calls:", 2)
-                                called_procs = sorted(list({call.called_name.lower() for call in calls}))
-                                for line in self._format_list_in_columns(called_procs):
-                                    add_line(line, 3)
+                                add_line("Procedure Calls:", 2, color=Color.CYAN)
+                                called_procs_info = defaultdict(lambda: {'reads': set(), 'modifies': set()})
+
+                                for call in calls:
+                                    called_name_lower = call.called_name.lower()
+                                    called_filename = proc_to_file_map.get(called_name_lower)
+
+                                    if called_filename:
+                                        # Globals Read in called procedure
+                                        called_reads = self.procedure_reads.get(called_filename, {}).get(called_name_lower, [])
+                                        read_globals = {var.lower() for var, _, _ in called_reads if var.lower() in global_var_names_lower}
+                                        called_procs_info[called_name_lower]['reads'].update(read_globals)
+
+                                        # Globals Modified in called procedure
+                                        called_assignments = self.procedure_assignments.get(called_filename, {}).get(called_name_lower, [])
+                                        modified_globals = {assign.variable.lower() for assign in called_assignments if assign.variable.lower() in global_var_names_lower}
+                                        called_procs_info[called_name_lower]['modifies'].update(modified_globals)
+                                
+                                for called_name, data_flow in sorted(called_procs_info.items()):
+                                    flow_parts = []
+                                    if data_flow['modifies']:
+                                        mod_str = f"Modifies: {', '.join(sorted(list(data_flow['modifies'])))}"
+                                        if use_color:
+                                            flow_parts.append(f"{Color.FAIL}{mod_str}{Color.ENDC}")
+                                        else:
+                                            flow_parts.append(mod_str)
+                                    
+                                    if data_flow['reads']:
+                                        read_str = f"Reads: {', '.join(sorted(list(data_flow['reads'])))}"
+                                        if use_color:
+                                            flow_parts.append(f"{Color.WARNING}{read_str}{Color.ENDC}")
+                                        else:
+                                            flow_parts.append(read_str)
+                                    
+                                    flow_display = f" ({'; '.join(flow_parts)})" if flow_parts else ""
+                                    add_line(f"- {called_name}{flow_display}", 3)
+
                                 add_line()
 
-                        # Global variable usage within the procedure
-                        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
-
-                        # Globals Read in this procedure
-                        proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
-                        read_globals_in_proc = sorted(list({var_name.lower() for var_name, _, _ in proc_reads if var_name.lower() in global_var_names_lower}))
-                        
+                        # Global variable usage within the procedure (already calculated above)
                         if read_globals_in_proc:
-                            add_line("Global Variables Read:", 2)
+                            add_line("Global Variables Read:", 2, color=Color.WARNING)
                             for line in self._format_list_in_columns(read_globals_in_proc):
                                 add_line(line, 3)
                             add_line()
 
-                        # Globals Modified in this procedure
-                        proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
-                        modified_globals_in_proc = sorted(list({assign.variable.lower() for assign in proc_assignments if assign.variable.lower() in global_var_names_lower}))
-
                         if modified_globals_in_proc:
-                            add_line("Global Variables Modified:", 2)
+                            add_line("Global Variables Modified:", 2, color=Color.FAIL)
                             for line in self._format_list_in_columns(modified_globals_in_proc):
                                 add_line(line, 3)
                             add_line()
@@ -879,17 +995,19 @@ class FortranVariableAnalyzer:
             add_line()
 
         # Cross-reference analysis
-        self._generate_cross_reference_analysis(add_line)
+        self._generate_cross_reference_analysis(add_line, use_color)
 
         # Call Graph Analysis
-        self._generate_call_graph_analysis(add_line)
+        self._generate_call_graph_analysis(add_line, use_color)
 
         report_text = '\n'.join(report_lines)
 
         if output_file:
+            # Strip color codes when writing to a file
+            report_text_no_color = re.sub(r'\033\[[0-9;]*m', '', report_text)
             with open(output_file, 'w') as f:
-                f.write(report_text)
-            print(f"Report written to {output_file}")
+                f.write(report_text_no_color)
+            cprint(f"Report written to {output_file}", Color.GREEN)
         else:
             print(report_text)
 
@@ -917,7 +1035,45 @@ class FortranVariableAnalyzer:
             
         return lines
 
-    def _format_variable_line(self, var_info: VariableInfo, scope_or_usage: str) -> str:
+    def _generate_global_hotspot_summary(self, add_line, use_color: bool):
+        """Generate a summary of global variable hotspots across the entire codebase."""
+        add_line("GLOBAL HOTSPOT SUMMARY", color=Color.HEADER)
+        add_line("-" * 50, color=Color.HEADER)
+
+        global_writes_count = defaultdict(int)
+        proc_global_write_counts = defaultdict(int)
+        global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
+
+        # Aggregate writes from all procedures in all analyzed files
+        for filename in self.procedure_assignments:
+            for proc_name, assignments in self.procedure_assignments[filename].items():
+                modified_globals_in_proc = {assign.variable.lower() for assign in assignments if assign.variable.lower() in global_var_names_lower}
+                if modified_globals_in_proc:
+                    proc_full_name = f"{proc_name} (in {Path(filename).name})"
+                    proc_global_write_counts[proc_full_name] += len(modified_globals_in_proc)
+                    for var_name in modified_globals_in_proc:
+                        global_writes_count[var_name] += 1
+        
+        sorted_global_writes = sorted(global_writes_count.items(), key=lambda item: item[1], reverse=True)
+        sorted_hotspots = sorted(proc_global_write_counts.items(), key=lambda item: item[1], reverse=True)
+
+        if sorted_hotspots:
+            add_line("Top Global Variable Modifying Procedures (Codebase-wide):", 1, color=Color.FAIL)
+            for proc_name, count in sorted_hotspots[:10]:
+                add_line(f"{proc_name:<40}: Modifies {count} unique global variables", 2)
+            add_line()
+
+        if sorted_global_writes:
+            add_line("Most Frequently Modified Global Variables (Codebase-wide):", 1, color=Color.FAIL)
+            for var_name, count in sorted_global_writes[:10]:
+                add_line(f"{var_name:<40}: Modified by {count} procedure(s)", 2)
+            add_line()
+        
+        if not sorted_hotspots and not sorted_global_writes:
+            add_line("No global variable modifications found.", 1)
+            add_line()
+
+    def _format_variable_line(self, var_info: VariableInfo, scope_or_usage: str, use_color: bool) -> str:
         """Formats a single line for a variable declaration with consistent padding."""
         line_prefix = f"Line {var_info.line_num:4d}:"
         name_str = f"{var_info.name:<20}"
@@ -933,10 +1089,27 @@ class FortranVariableAnalyzer:
             attributes.append("[ALLOCATABLE]")
         
         attr_str = ' '.join(attributes)
-        
-        return f"{line_prefix} {name_str} {type_str} {attr_str:<25} [{scope_or_usage}]"
 
-    def _generate_file_summary(self, filename: str, add_line):
+        if use_color:
+            scope_color = Color.ENDC
+            if "MODIFIED" in scope_or_usage:
+                scope_color = Color.FAIL
+            elif "USED" in scope_or_usage:
+                scope_color = Color.GREEN
+            elif "UNUSED" in scope_or_usage:
+                scope_color = Color.WARNING
+            elif "GLOBAL" in scope_or_usage:
+                scope_color = Color.BLUE
+            
+            name_str = f"{Color.BOLD}{name_str}{Color.ENDC}"
+            type_str = f"{Color.CYAN}{type_str}{Color.ENDC}"
+            scope_str = f"[{scope_color}{scope_or_usage}{Color.ENDC}]"
+        else:
+            scope_str = f"[{scope_or_usage}]"
+        
+        return f"{line_prefix} {name_str} {type_str} {attr_str:<25} {scope_str}"
+
+    def _generate_file_summary(self, filename: str, add_line, use_color: bool):
         """Generate a high-level summary for a single file."""
         procedures = self.file_procedures.get(filename, [])
         if not procedures:
@@ -967,25 +1140,25 @@ class FortranVariableAnalyzer:
         sorted_global_writes = sorted(global_writes_count.items(), key=lambda item: item[1], reverse=True)
         sorted_hotspots = sorted(proc_global_write_counts, key=lambda item: item[1], reverse=True)
 
-        add_line("High-Level Summary", 1)
-        add_line("------------------", 1)
+        add_line("High-Level Summary", 1, color=Color.BLUE)
+        add_line("------------------", 1, color=Color.BLUE)
         add_line(f"Total Procedures: {len(procedures)}", 2)
         add_line()
 
         if sorted_hotspots:
-            add_line("Top Global Variable Modifiers (Hotspots):", 2)
+            add_line("Top Global Variable Modifiers (Hotspots):", 2, color=Color.WARNING)
             for proc_name, count in sorted_hotspots[:5]:
                 add_line(f"{proc_name:<30}: Modifies {count} global variables", 3)
             add_line()
 
         if sorted_global_writes:
-            add_line("Most Frequently Modified Global Variables:", 2)
+            add_line("Most Frequently Modified Global Variables:", 2, color=Color.FAIL)
             for var_name, count in sorted_global_writes[:5]:
                 add_line(f"{var_name:<30}: Modified in {count} procedure(s)", 3)
             add_line()
 
         if sorted_global_reads:
-            add_line("Most Frequently Read Global Variables:", 2)
+            add_line("Most Frequently Read Global Variables:", 2, color=Color.WARNING)
             for var_name, count in sorted_global_reads[:5]:
                 add_line(f"{var_name:<30}: Read {count} time(s)", 3)
             add_line()
@@ -993,21 +1166,22 @@ class FortranVariableAnalyzer:
         add_line("-" * 80)
         add_line()
 
-    def _generate_global_summary(self, add_line, show_all_globals: bool):
+    def _generate_global_summary(self, add_line, show_all_globals: bool, use_color: bool):
         """Generate global variables summary"""
-        add_line("GLOBAL VARIABLES SUMMARY")
-        add_line("-" * 50)
+        add_line("GLOBAL VARIABLES SUMMARY", color=Color.HEADER)
+        add_line("-" * 50, color=Color.HEADER)
         add_line(f"Total modules found: {len(self.modules)}")
         add_line(f"Total global variables: {len(self.global_variables)}")
 
         if show_all_globals:
-            add_line("Showing ALL global variables (--show-all-globals specified)")
+            add_line("Showing ALL global variables (--show-all-globals specified)", color=Color.CYAN)
         else:
-            add_line("Showing first 10 variables per module (use --show-all-globals for complete list)")
+            add_line("Showing first 10 variables per module (use --show-all-globals for complete list)", color=Color.CYAN)
         add_line()
 
         for module_name, variables in self.modules.items():
-            add_line(f"Module: {module_name} ({len(variables)} variables)")
+            location = self.module_locations.get(module_name, 'unknown file')
+            add_line(f"Module: {module_name} (in {location}) ({len(variables)} variables)", color=Color.BLUE)
 
             # Show all variables if requested, otherwise limit to 10
             display_vars = variables if show_all_globals else variables[:10]
@@ -1020,7 +1194,7 @@ class FortranVariableAnalyzer:
                 if var_name in self.global_variables:
                     var_info = self.global_variables[var_name]
                     usage_status = self._check_global_variable_usage(var_name)
-                    line_str = self._format_variable_line(var_info, usage_status)
+                    line_str = self._format_variable_line(var_info, usage_status, use_color)
                     add_line(line_str, 1)
 
                     if "USED" in usage_status:
@@ -1029,17 +1203,17 @@ class FortranVariableAnalyzer:
                         modified_count += 1
 
             if not show_all_globals and len(variables) > 10:
-                add_line(f"  ... and {len(variables) - 10} more variables (use --show-all-globals to see all)", 1)
+                add_line(f"  ... and {len(variables) - 10} more variables (use --show-all-globals to see all)", 1, color=Color.CYAN)
 
             # Add module usage summary
             usage_pct = (used_count / len(display_vars)) * 100 if display_vars else 0
             add_line(f"  Module Usage: {used_count}/{len(display_vars)} variables used ({usage_pct:.1f}%), {modified_count} modified", 1)
             add_line()
 
-    def _generate_cross_reference_analysis(self, add_line):
+    def _generate_cross_reference_analysis(self, add_line, use_color: bool):
         """Generate cross-reference analysis"""
-        add_line("CROSS-REFERENCE ANALYSIS")
-        add_line("-" * 30)
+        add_line("CROSS-REFERENCE ANALYSIS", color=Color.HEADER)
+        add_line("-" * 30, color=Color.HEADER)
 
         # Collect all assignments and reads from both file and procedure level
         all_assigned_vars = set()
@@ -1067,28 +1241,28 @@ class FortranVariableAnalyzer:
 
         global_var_names = {name.lower() for name in self.global_variables.keys()}
 
-        add_line("Global variables being modified:", 1)
+        add_line("Global variables being modified:", 1, color=Color.FAIL)
         modified_globals = sorted(list(all_assigned_vars.intersection(global_var_names)))
         for line in self._format_list_in_columns(modified_globals):
             add_line(line, 2)
 
         add_line()
-        add_line("Global variables being read:", 1)
+        add_line("Global variables being read:", 1, color=Color.WARNING)
         read_globals = sorted(list(all_read_vars.intersection(global_var_names)))
         for line in self._format_list_in_columns(read_globals):
             add_line(line, 2)
 
         add_line()
-        add_line("Variables assigned but not in global scope:", 1)
+        add_line("Variables assigned but not in global scope:", 1, color=Color.CYAN)
         local_assigned = sorted(list(all_assigned_vars - global_var_names))
         for line in self._format_list_in_columns(local_assigned):
             add_line(line, 2)
 
-    def _generate_call_graph_analysis(self, add_line):
+    def _generate_call_graph_analysis(self, add_line, use_color: bool):
         """Generate a reverse call graph (who calls whom)."""
         add_line()
-        add_line("CALL GRAPH ANALYSIS (Who calls whom)")
-        add_line("-" * 40)
+        add_line("CALL GRAPH ANALYSIS (Who calls whom)", color=Color.HEADER)
+        add_line("-" * 40, color=Color.HEADER)
 
         # Build a reverse map: called_proc -> [calling_proc1, calling_proc2, ...]
         reverse_call_map = defaultdict(list)
@@ -1113,15 +1287,19 @@ class FortranVariableAnalyzer:
             callers = sorted(list(set(reverse_call_map[called_proc])))
             
             # Check if the called procedure is defined in the analyzed files
-            status = "[DEFINED]" if called_proc in all_known_procs else "[EXTERNAL/UNDEFINED]"
-            
+            is_defined = called_proc in all_known_procs
+            status = "[DEFINED]" if is_defined else "[EXTERNAL/UNDEFINED]"
+            if use_color:
+                color = Color.GREEN if is_defined else Color.WARNING
+                status = f"{color}{status}{Color.ENDC}"
+
             add_line(f"Procedure: {called_proc} {status}", 1)
             add_line(f"  Called by ({len(callers)}):", 1)
             for caller in callers:
                 add_line(caller, 2)
             add_line()
 
-    def classify_variable_scope(self, var_name: str, filename: str) -> str:
+    def classify_variable_scope(self, var_name: str, filename: str, proc_name: Optional[str] = None) -> str:
         """Enhanced scope classification"""
         var_lower = var_name.lower()
 
@@ -1129,26 +1307,41 @@ class FortranVariableAnalyzer:
         if var_lower in [v.lower() for v in self.global_variables.keys()]:
             return "GLOBAL"
 
+        # Check procedure-level variables first if proc_name is given
+        if proc_name and filename in self.procedure_variables:
+            if proc_name in self.procedure_variables[filename]:
+                proc_var_names = [v.name.lower() for v in self.procedure_variables[filename][proc_name]]
+                if var_lower in proc_var_names:
+                    return f"LOCAL"
+
         # Check if it's a local variable in current file
         if filename in self.file_variables:
             local_vars = [v.name.lower() for v in self.file_variables[filename]]
             if var_lower in local_vars:
                 return "FILE_LOCAL"
 
-        # Check procedure-level variables
-        if filename in self.procedure_variables:
-            for proc_name, proc_vars in self.procedure_variables[filename].items():
-                proc_var_names = [v.name.lower() for v in proc_vars]
-                if var_lower in proc_var_names:
-                    return f"PROC_LOCAL({proc_name})"
+        # Check if it's from a USE statement (procedure scope)
+        if proc_name and filename in self.procedure_use_statements:
+            if proc_name in self.procedure_use_statements[filename]:
+                for module, only_list, _ in self.procedure_use_statements[filename][proc_name]:
+                    if only_list == 'all' and module in self.modules:
+                        if var_lower in [v.lower() for v in self.modules[module]]:
+                             return f"IMPORTED"
+                    elif only_list != 'all':
+                        only_vars = [v.strip().lower() for v in only_list.split(',')]
+                        if var_lower in only_vars:
+                            return f"IMPORTED"
 
-        # Check if it's from a USE statement
+        # Check if it's from a USE statement (file scope)
         if filename in self.use_statements:
             for module, only_list, _ in self.use_statements[filename]:
-                if only_list != 'all':
+                if only_list == 'all' and module in self.modules:
+                    if var_lower in [v.lower() for v in self.modules[module]]:
+                        return f"IMPORTED"
+                elif only_list != 'all':
                     only_vars = [v.strip().lower() for v in only_list.split(',')]
                     if var_lower in only_vars:
-                        return f"IMPORTED_FROM_{module.upper()}"
+                        return f"IMPORTED"
 
         return "UNKNOWN"
 
@@ -1231,12 +1424,24 @@ def main():
                        help='Generate enhanced report with statistics and recommendations')
     parser.add_argument('--truncate', action='store_true',
                        help='Truncate long lists (default: show full lists)')
+    parser.add_argument('--color', choices=['auto', 'always', 'never'], default='auto',
+                       help='Control colorized output. `always` is useful for piping to `less -R`.')
     
+    # New filtering options
+    parser.add_argument('--show-only-file', nargs='+', metavar='FILENAME',
+                       help='Only show analysis for specific file(s) by name.')
+    parser.add_argument('--show-only-proc', nargs='+', metavar='PROCNAME',
+                       help='Only show analysis for specific procedure(s) by name.')
+    parser.add_argument('--hide-locals', action='store_true',
+                       help='Hide local variable declaration lists in procedures.')
+    parser.add_argument('--hide-ok', action='store_true',
+                       help='Hide procedures that do not read or modify any global variables.')
+
     args = parser.parse_args()
     
     codebase_path = Path(args.codebase_dir)
     if not codebase_path.is_dir():
-        print(f"Error: Codebase directory not found: {args.codebase_dir}")
+        cprint(f"Error: Codebase directory not found: {args.codebase_dir}", Color.FAIL, force_color=args.color=='always')
         return 1
 
     # Determine which files to run the detailed analysis on
@@ -1244,21 +1449,21 @@ def main():
         analysis_targets = [Path(f) for f in args.files_to_analyze]
     else:
         # If no specific files are given, analyze all Fortran files in the codebase dir
-        print("No specific files provided; analyzing all Fortran files in the codebase directory.")
+        cprint("No specific files provided; analyzing all Fortran files in the codebase directory.", Color.WARNING, force_color=args.color=='always')
         analysis_targets = []
         extensions = ['*.f90', '*.f', '*.F90', '*.F']
         for ext in extensions:
             analysis_targets.extend(codebase_path.rglob(ext))
 
     if not analysis_targets:
-        print(f"Error: No Fortran files found to analyze.")
+        cprint(f"Error: No Fortran files found to analyze.", Color.FAIL, force_color=args.color=='always')
         return 1
     
     # Initialize analyzer
     try:
         analyzer = FortranVariableAnalyzer()
     except Exception as e:
-        print(f"Error initializing analyzer: {e}")
+        cprint(f"Error initializing analyzer: {e}", Color.FAIL, force_color=args.color=='always')
         if args.debug:
             import traceback
             traceback.print_exc()
@@ -1269,30 +1474,40 @@ def main():
     
     # Pass 2: Analyze each target input file in detail
     analyzed_count = 0
-    print("\nStarting detailed analysis...")
+    cprint("\nStarting detailed analysis...", Color.BOLD, force_color=args.color=='always')
     for file_path in analysis_targets:
         try:
             analyzer.analyze_file(str(file_path))
             analyzed_count += 1
         except Exception as e:
-            print(f"Error analyzing {file_path}: {e}")
+            cprint(f"Error analyzing {file_path}: {e}", Color.FAIL, force_color=args.color=='always')
             if args.debug:
                 import traceback
                 traceback.print_exc()
     
     if analyzed_count == 0:
-        print("Error: No files were successfully analyzed")
+        cprint("Error: No files were successfully analyzed", Color.FAIL, force_color=args.color=='always')
         return 1
     
-    print(f"\nSuccessfully analyzed {analyzed_count}/{len(analysis_targets)} files")
+    cprint(f"\nSuccessfully analyzed {analyzed_count}/{len(analysis_targets)} files", Color.GREEN, force_color=args.color=='always')
     
     # Generate report
     try:
-        analyzer.generate_report(args.output, args.show_all_globals, args.truncate)
+        analyzer.generate_report(
+            args.output, 
+            args.show_all_globals, 
+            args.truncate, 
+            args.enhanced,
+            show_only_file=args.show_only_file,
+            show_only_proc=args.show_only_proc,
+            hide_locals=args.hide_locals,
+            hide_ok=args.hide_ok,
+            color_mode=args.color
+        )
         return 0
         
     except Exception as e:
-        print(f"Error generating report: {e}")
+        cprint(f"Error generating report: {e}", Color.FAIL, force_color=args.color=='always')
         if args.debug:
             import traceback
             traceback.print_exc()
