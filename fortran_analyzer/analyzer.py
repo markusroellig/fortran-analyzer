@@ -214,9 +214,26 @@ class FortranVariableAnalyzer:
         # Analyze file-level and procedure-level content
         current_module = None
         current_procedure = None
+        
+        line_buffer = ""
+        line_idx = 0
+        while line_idx < len(lines):
+            i = line_idx + 1
+            original_line = lines[line_idx]
+            line_idx += 1
 
-        for i, line in enumerate(lines, 1):
-            line_clean = self.clean_line(line)
+            if not line_buffer:
+                start_line_num = i
+
+            # Handle line continuations
+            clean_original = self.clean_line(original_line)
+            line_buffer += clean_original.rstrip(' &')
+            
+            if clean_original.endswith('&'):
+                continue
+
+            line_clean = line_buffer
+            line_buffer = "" # Reset buffer
             line_lower = line_clean.lower()
 
             # Skip empty lines
@@ -241,46 +258,48 @@ class FortranVariableAnalyzer:
                 proc_name = proc_match.group(2)
                 # Find the corresponding procedure info
                 for proc in procedures:
-                    if proc.name.lower() == proc_name and proc.start_line == i:
+                    if proc.name.lower() == proc_name and proc.start_line == start_line_num:
                         current_procedure = proc
                         break
                 continue
 
             # Check if we're at the end of a procedure
-            if current_procedure and i >= current_procedure.end_line:
+            if current_procedure and start_line_num >= current_procedure.end_line:
                 current_procedure = None
 
             # Determine analysis scope (file-level vs procedure-level)
             scope_key = self.get_scope_key(filename, current_procedure)
 
             # Parse USE statements
-            use_match = re.match(r'^\s*use\s+(\w+)(?:\s*,\s*only\s*:\s*(.+))?', line_lower)
+            use_match = re.match(r'^\s*use\s+(\w+)(?:\s*,\s*only\s*:\s*(.+))?', line_lower, re.DOTALL)
             if use_match:
                 module_name = use_match.group(1)
                 only_list = use_match.group(2) if use_match.group(2) else 'all'
+                if only_list != 'all':
+                    only_list = ' '.join(only_list.split())
 
                 if current_procedure:
-                    self.procedure_use_statements[filename][current_procedure.name].append((module_name, only_list, i))
+                    self.procedure_use_statements[filename][current_procedure.name].append((module_name, only_list, start_line_num))
                 else:
-                    self.use_statements[filename].append((module_name, only_list, i))
+                    self.use_statements[filename].append((module_name, only_list, start_line_num))
                 continue
 
             # Parse variable declarations
-            var_infos = self.parse_variable_declaration(line_clean, i, current_module or 'local')
+            var_infos = self.parse_variable_declaration(line_clean, start_line_num, current_module or 'local')
             if current_procedure:
                 self.procedure_variables[filename][current_procedure.name].extend(var_infos)
             else:
                 self.file_variables[filename].extend(var_infos)
 
             # Parse assignments
-            assignments = self.parse_assignments(line_clean, i, filename)
+            assignments = self.parse_assignments(line_clean, start_line_num, filename)
             if current_procedure:
                 self.procedure_assignments[filename][current_procedure.name].extend(assignments)
             else:
                 self.file_assignments[filename].extend(assignments)
 
             # Parse variable reads
-            reads = self.parse_variable_reads(line_clean, i, filename)
+            reads = self.parse_variable_reads(line_clean, start_line_num, filename)
             if current_procedure:
                 self.procedure_reads[filename][current_procedure.name].extend(reads)
             else:
@@ -652,7 +671,7 @@ class FortranVariableAnalyzer:
                     add_line(f"Line {line_num:4d}: USE {module}", 2)
                     if only_list != 'all':
                         only_clean = only_list.replace('\n', ' ').replace('\t', ' ')
-                        add_line(f"            ONLY: {only_clean[:60]}", 2)
+                        add_line(f"            ONLY: {only_clean}", 2)
                 add_line()
 
             # File-level variable declarations
@@ -692,7 +711,7 @@ class FortranVariableAnalyzer:
                                 add_line(f"Line {line_num:4d}: USE {module}", 3)
                                 if only_list != 'all':
                                     only_clean = only_list.replace('\n', ' ').replace('\t', ' ')
-                                    add_line(f"            ONLY: {only_clean[:50]}", 3)
+                                    add_line(f"            ONLY: {only_clean}", 3)
                             add_line()
 
                         # Procedure-level variable declarations
