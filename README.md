@@ -4,8 +4,9 @@ A comprehensive tool for analyzing Fortran source code to identify variable sour
 
 ## Features
 
-- **Procedure-level analysis**: Separate analysis for each subroutine and function
-- **Variable scope classification**: Identifies global, local, and imported variables
+- **Whole-codebase scanning**: Scans an entire directory to build a complete map of all modules and global variables before analysis.
+- **Procedure-level analysis**: Separate analysis for each subroutine and function.
+- **Variable scope classification**: Identifies global, local, and imported variables with codebase-wide context.
 - **Assignment pattern detection**: Categorizes different types of variable assignments
 - **Cross-reference analysis**: Shows relationships between variables across files
 - **Flexible output**: Complete lists by default, with optional truncation for large codebases
@@ -34,42 +35,49 @@ chmod +x analyze_fortran_vars.sh
 
 ## Usage
 
+The analyzer now operates in two passes:
+1.  **Discovery Pass**: It first scans a specified codebase directory to find all modules and global variables.
+2.  **Analysis Pass**: It then performs a detailed analysis on target files, using the global context from the first pass.
+
 ### Command line (after pip installation)
 
 ```bash
-# Basic analysis
-fortran-analyzer input_file.f90
+# Analyze all .f90 files in a directory
+# Scans the directory for globals, then analyzes every file.
+fortran-analyzer path/to/your/codebase
 
-# With custom mod_parameters file
-fortran-analyzer -m path/to/mod_parameters.f90 *.f90
+# Analyze a single file within the context of the whole codebase
+# Scans the 'codebase' dir for globals, but only generates a report for 'file_to_analyze.f90'.
+fortran-analyzer path/to/your/codebase path/to/your/codebase/file_to_analyze.f90
 
-# Save output to file with all global variables shown
-fortran-analyzer -a -o analysis_report.txt *.f90
+# Analyze multiple specific files
+fortran-analyzer path/to/your/codebase file1.f90 file2.f90
 
-# Truncate output for large files
-fortran-analyzer --truncate large_file.f90
+# Save the full report for the entire codebase to a file
+fortran-analyzer path/to/your/codebase -o analysis_report.txt
 
-# Enable debug mode
-fortran-analyzer --debug problematic_file.f90
+# Show all global variables in the report (not just a summary)
+fortran-analyzer path/to/your/codebase --show-all-globals
 ```
 
 ### Via wrapper script
 
 ```bash
 # Use the wrapper script (works with or without pip installation)
-./analyze_fortran_vars.sh input_file.f90
+./analyze_fortran_vars.sh path/to/your/codebase
 ```
 
 ## Command Line Options
 
+- `codebase_dir`: (Positional) The directory containing the full Fortran codebase to scan for globals.
+- `files_to_analyze`: (Optional Positional) Specific Fortran files to analyze in detail. If omitted, all Fortran files in `codebase_dir` are analyzed.
 - `-h, --help`: Show help message
-- `-m, --mod-parameters`: Path to mod_parameters.f90 file
 - `-o, --output`: Output file for report
 - `-v, --verbose`: Verbose output
-- `-a, --show-all-globals`: Show all global variables
-- `-e, --enhanced`: Generate enhanced report with statistics
-- `-t, --truncate`: Truncate long lists
-- `--debug`: Enable debug mode
+- `--show-all-globals`: Show all global variables instead of limiting the list.
+- `--enhanced`: Generate enhanced report with statistics.
+- `--truncate`: Truncate long lists in the report.
+- `--debug`: Enable debug mode for more detailed error output.
 
 ## Development
 

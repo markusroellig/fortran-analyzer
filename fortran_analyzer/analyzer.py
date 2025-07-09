@@ -25,16 +25,20 @@ AssignmentInfo = namedtuple('AssignmentInfo', [
     'variable', 'line_num', 'assignment_type', 'rhs', 'context'
 ])
 
+CallInfo = namedtuple('CallInfo', [
+    'called_name', 'line_num', 'call_type'
+])
+
 ProcedureInfo = namedtuple('ProcedureInfo', [
-    'name', 'type', 'start_line', 'end_line', 'module', 'arguments'
+    'name', 'type', 'start_line', 'end_line', 'module', 'arguments', 'calls'
 ])
 
 # Copy the entire FortranVariableAnalyzer class here from your original file
 # (The class definition remains the same)
 class FortranVariableAnalyzer:
-    def __init__(self, mod_parameters_file: str = None):
+    def __init__(self):
         self.global_variables = {}
-        self.modules = {}
+        self.modules = defaultdict(list)
 
         # File-level structures
         self.file_variables = defaultdict(list)
@@ -47,10 +51,75 @@ class FortranVariableAnalyzer:
         self.procedure_variables = defaultdict(lambda: defaultdict(list))
         self.procedure_assignments = defaultdict(lambda: defaultdict(list))
         self.procedure_reads = defaultdict(lambda: defaultdict(list))
+        self.procedure_calls = defaultdict(lambda: defaultdict(list))
         self.procedure_use_statements = defaultdict(lambda: defaultdict(list))
 
-        if mod_parameters_file:
-            self.parse_global_variables(mod_parameters_file)
+    def scan_directory_for_globals(self, source_dir: Path):
+        """
+        Pass 1: A fast scan of all files in a directory to find all module-level
+        (global) variables.
+        """
+        print(f"Scanning {source_dir} for global variables...")
+        fortran_files = []
+        extensions = ['*.f90', '*.f', '*.F90', '*.F']
+        for ext in extensions:
+            fortran_files.extend(source_dir.rglob(ext))
+
+        for file_path in fortran_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception as e:
+                print(f"Warning: Could not read {file_path} during scan: {e}")
+                continue
+            
+            self._discover_globals_in_content(content)
+        
+        print(f"Found {len(self.global_variables)} global variables in {len(self.modules)} modules.")
+
+    def _discover_globals_in_content(self, content: str):
+        """Helper for scan_directory_for_globals to parse content."""
+        current_module = None
+        lines = content.split('\n')
+        
+        line_buffer = ""
+        for line in lines:
+            clean_original = self.clean_line(line)
+            line_buffer += clean_original.rstrip(' &')
+            
+            if clean_original.endswith('&'):
+                continue
+
+            line_clean = line_buffer
+            line_buffer = "" # Reset buffer
+            line_lower = line_clean.lower()
+
+            if not line_clean:
+                continue
+
+            module_match = re.match(r'^\s*module\s+(\w+)', line_lower)
+            if module_match and not line_lower.startswith('end module'):
+                current_module = module_match.group(1)
+                continue
+
+            if re.match(r'^\s*end\s+module', line_lower):
+                current_module = None
+                continue
+            
+            # Only look for globals if we are inside a module
+            if current_module:
+                # We are only interested in declarations, not procedure bodies
+                proc_match = re.match(r'^\s*(subroutine|function|contains)', line_lower)
+                if proc_match:
+                    current_module = None # Stop parsing this module
+                    continue
+
+                var_infos = self.parse_variable_declaration(line_clean, 0, current_module)
+                for var_info in var_infos:
+                    if var_info.name not in self.global_variables:
+                        self.global_variables[var_info.name] = var_info
+                    if var_info.name not in self.modules[current_module]:
+                        self.modules[current_module].append(var_info.name)
 
     def clean_line(self, line: str) -> str:
         """Remove comments and clean up line"""
@@ -72,57 +141,6 @@ class FortranVariableAnalyzer:
             clean_line += char
 
         return clean_line.strip()
-
-    def parse_global_variables(self, filename: str):
-        """Parse mod_parameters.f90 to extract global variable definitions"""
-        print(f"Parsing global variables from {filename}...")
-
-        try:
-            with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-            return
-
-        current_module = None
-        in_type_def = False
-
-        lines = content.split('\n')
-        for i, line in enumerate(lines, 1):
-            line_clean = self.clean_line(line)
-            line_lower = line_clean.lower()
-
-            # Skip empty lines
-            if not line_clean:
-                continue
-
-            # Module detection
-            module_match = re.match(r'^\s*module\s+(\w+)', line_lower)
-            if module_match and not line_lower.startswith('end module'):
-                current_module = module_match.group(1)
-                self.modules[current_module] = []
-                continue
-
-            # End module
-            if re.match(r'^\s*end\s+module', line_lower):
-                current_module = None
-                continue
-
-            # Type definition detection
-            type_match = re.match(r'^\s*type\s*::\s*(\w+)', line_lower)
-            if type_match:
-                in_type_def = True
-                continue
-
-            if re.match(r'^\s*end\s+type', line_lower):
-                in_type_def = False
-                continue
-
-            if current_module and not in_type_def:
-                var_infos = self.parse_variable_declaration(line_clean, i, current_module)
-                for var_info in var_infos:
-                    self.global_variables[var_info.name] = var_info
-                    self.modules[current_module].append(var_info.name)
 
     def parse_procedures(self, filename: str, content: str) -> List[ProcedureInfo]:
         """Parse procedures (subroutines and functions) from file content"""
@@ -160,7 +178,8 @@ class FortranVariableAnalyzer:
                     start_line=i,
                     end_line=end_line,
                     module=current_module,
-                    arguments=arguments
+                    arguments=arguments,
+                    calls=[] # Initialize calls list
                 ))
 
         return procedures
@@ -290,6 +309,14 @@ class FortranVariableAnalyzer:
                 self.procedure_variables[filename][current_procedure.name].extend(var_infos)
             else:
                 self.file_variables[filename].extend(var_infos)
+                # If we are in a module but not a procedure, these are global variables
+                if current_module:
+                    for var_info in var_infos:
+                        if var_info.name not in self.global_variables:
+                            self.global_variables[var_info.name] = var_info
+                        if var_info.name not in self.modules[current_module]:
+                            self.modules[current_module].append(var_info.name)
+
 
             # Parse assignments
             assignments = self.parse_assignments(line_clean, start_line_num, filename)
@@ -304,6 +331,11 @@ class FortranVariableAnalyzer:
                 self.procedure_reads[filename][current_procedure.name].extend(reads)
             else:
                 self.file_reads[filename].extend(reads)
+
+            # Parse procedure calls
+            if current_procedure:
+                calls = self.parse_procedure_calls(line_clean, start_line_num)
+                self.procedure_calls[filename][current_procedure.name].extend(calls)
 
     def get_scope_key(self, filename: str, procedure: Optional[ProcedureInfo]) -> str:
         """Generate a scope key for organizing data"""
@@ -640,6 +672,41 @@ class FortranVariableAnalyzer:
 
         return reads
 
+    def parse_procedure_calls(self, line: str, line_num: int) -> List[CallInfo]:
+        """Parse procedure calls from a line."""
+        calls = []
+        line_clean = line.strip()
+        line_lower = line_clean.lower()
+
+        # Pattern for 'call subroutine_name(...)'
+        call_match = re.match(r'^\s*call\s+([a-zA-Z_]\w*)', line_lower)
+        if call_match:
+            calls.append(CallInfo(
+                called_name=call_match.group(1),
+                line_num=line_num,
+                call_type='subroutine'
+            ))
+
+        # Pattern for function calls: name(...)
+        # This is a simple heuristic and may misidentify array access as function calls.
+        # It avoids matching names on the LHS of an assignment.
+        search_text = line_clean
+        if '=' in search_text and not search_text.lstrip().lower().startswith('if'):
+             search_text = search_text.split('=', 1)[1]
+
+        func_matches = re.findall(r'\b([a-zA-Z_]\w*)\s*\(', search_text)
+        if func_matches:
+            # A simple filter to avoid common intrinsic functions
+            fortran_intrinsics = {'dble', 'real', 'int', 'abs', 'mod', 'max', 'min', 'sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'trim', 'adjustl', 'len', 'anint', 'log10', 'dabs', 'dsin', 'allocated'}
+            for func_name in func_matches:
+                if func_name.lower() not in fortran_intrinsics:
+                    calls.append(CallInfo(
+                        called_name=func_name,
+                        line_num=line_num,
+                        call_type='function'
+                    ))
+        return calls
+
     def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False):
         """Generate comprehensive analysis report with procedure-level analysis"""
         report_lines = []
@@ -773,6 +840,17 @@ class FortranVariableAnalyzer:
                                     add_line(f"{var_name:<20}: {count:3d} reads [{scope_status}]", 3)
                                 add_line()
 
+                        # Procedure-level calls
+                        if (filename in self.procedure_calls and
+                            proc.name in self.procedure_calls[filename]):
+                            calls = self.procedure_calls[filename][proc.name]
+                            if calls:
+                                add_line("Procedure Calls:", 2)
+                                called_procs = sorted(list({call.called_name.lower() for call in calls}))
+                                for line in self._format_list_in_columns(called_procs):
+                                    add_line(line, 3)
+                                add_line()
+
                         # Global variable usage within the procedure
                         global_var_names_lower = {name.lower() for name in self.global_variables.keys()}
 
@@ -802,6 +880,9 @@ class FortranVariableAnalyzer:
 
         # Cross-reference analysis
         self._generate_cross_reference_analysis(add_line)
+
+        # Call Graph Analysis
+        self._generate_call_graph_analysis(add_line)
 
         report_text = '\n'.join(report_lines)
 
@@ -1003,6 +1084,43 @@ class FortranVariableAnalyzer:
         for line in self._format_list_in_columns(local_assigned):
             add_line(line, 2)
 
+    def _generate_call_graph_analysis(self, add_line):
+        """Generate a reverse call graph (who calls whom)."""
+        add_line()
+        add_line("CALL GRAPH ANALYSIS (Who calls whom)")
+        add_line("-" * 40)
+
+        # Build a reverse map: called_proc -> [calling_proc1, calling_proc2, ...]
+        reverse_call_map = defaultdict(list)
+        all_known_procs = set()
+
+        for filename, procs in self.file_procedures.items():
+            for proc in procs:
+                all_known_procs.add(proc.name.lower())
+                if filename in self.procedure_calls and proc.name in self.procedure_calls[filename]:
+                    calls = self.procedure_calls[filename][proc.name]
+                    for call in calls:
+                        reverse_call_map[call.called_name.lower()].append(f"{proc.name} (in {Path(filename).name})")
+
+        # Sort by procedure name
+        sorted_called_procs = sorted(reverse_call_map.keys())
+
+        if not sorted_called_procs:
+            add_line("No procedure calls were found.", 1)
+            return
+
+        for called_proc in sorted_called_procs:
+            callers = sorted(list(set(reverse_call_map[called_proc])))
+            
+            # Check if the called procedure is defined in the analyzed files
+            status = "[DEFINED]" if called_proc in all_known_procs else "[EXTERNAL/UNDEFINED]"
+            
+            add_line(f"Procedure: {called_proc} {status}", 1)
+            add_line(f"  Called by ({len(callers)}):", 1)
+            for caller in callers:
+                add_line(caller, 2)
+            add_line()
+
     def classify_variable_scope(self, var_name: str, filename: str) -> str:
         """Enhanced scope classification"""
         var_lower = var_name.lower()
@@ -1094,13 +1212,13 @@ class FortranVariableAnalyzer:
 def main():
     """Main entry point for the command line interface"""
     parser = argparse.ArgumentParser(
-        description="Analyze Fortran source files for variable sources and dependencies with procedure-level analysis",
+        description="Analyze Fortran source files for variable sources and dependencies. "
+                    "Scans a codebase for globals then analyzes specific files.",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('files', nargs='+', help='Fortran source files to analyze')
-    parser.add_argument('--mod-parameters', '-m', 
-                       default='mod_parameters.f90',
-                       help='Path to mod_parameters.f90 file (default: mod_parameters.f90)')
+    parser.add_argument('codebase_dir', help='Directory containing the full Fortran codebase to scan for globals.')
+    parser.add_argument('files_to_analyze', nargs='*', 
+                       help='(Optional) Specific Fortran files to analyze in detail. If omitted, all files in codebase_dir are analyzed.')
     parser.add_argument('--output', '-o',
                        help='Output file for report (default: print to stdout)')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -1116,35 +1234,48 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate input files exist
-    missing_files = [f for f in args.files if not Path(f).exists()]
-    if missing_files:
-        print(f"Error: The following files were not found: {missing_files}")
+    codebase_path = Path(args.codebase_dir)
+    if not codebase_path.is_dir():
+        print(f"Error: Codebase directory not found: {args.codebase_dir}")
         return 1
-    
-    # Validate mod_parameters file
-    if not Path(args.mod_parameters).exists():
-        print(f"Warning: mod_parameters file not found: {args.mod_parameters}")
-        args.mod_parameters = None
+
+    # Determine which files to run the detailed analysis on
+    if args.files_to_analyze:
+        analysis_targets = [Path(f) for f in args.files_to_analyze]
+    else:
+        # If no specific files are given, analyze all Fortran files in the codebase dir
+        print("No specific files provided; analyzing all Fortran files in the codebase directory.")
+        analysis_targets = []
+        extensions = ['*.f90', '*.f', '*.F90', '*.F']
+        for ext in extensions:
+            analysis_targets.extend(codebase_path.rglob(ext))
+
+    if not analysis_targets:
+        print(f"Error: No Fortran files found to analyze.")
+        return 1
     
     # Initialize analyzer
     try:
-        analyzer = FortranVariableAnalyzer(args.mod_parameters)
+        analyzer = FortranVariableAnalyzer()
     except Exception as e:
         print(f"Error initializing analyzer: {e}")
         if args.debug:
             import traceback
             traceback.print_exc()
         return 1
+
+    # Pass 1: Scan the entire codebase for global variables
+    analyzer.scan_directory_for_globals(codebase_path)
     
-    # Analyze each input file
+    # Pass 2: Analyze each target input file in detail
     analyzed_count = 0
-    for filename in args.files:
+    print("\nStarting detailed analysis...")
+    for file_path in analysis_targets:
         try:
-            analyzer.analyze_file(filename)
+            analyzer.analyze_file(str(file_path))
             analyzed_count += 1
         except Exception as e:
-            print(f"Error analyzing {filename}: {e}")
+            print(f"Error analyzing {file_path}: {e}")
             if args.debug:
                 import traceback
                 traceback.print_exc()
@@ -1153,7 +1284,7 @@ def main():
         print("Error: No files were successfully analyzed")
         return 1
     
-    print(f"Successfully analyzed {analyzed_count}/{len(args.files)} files")
+    print(f"\nSuccessfully analyzed {analyzed_count}/{len(analysis_targets)} files")
     
     # Generate report
     try:
