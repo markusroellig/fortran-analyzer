@@ -25,8 +25,12 @@ AssignmentInfo = namedtuple('AssignmentInfo', [
     'variable', 'line_num', 'assignment_type', 'rhs', 'context'
 ])
 
+ArgumentInfo = namedtuple('ArgumentInfo', [
+    'name', 'intent', 'type_info'
+])
+
 CallInfo = namedtuple('CallInfo', [
-    'called_name', 'line_num', 'call_type'
+    'called_name', 'line_num', 'call_type', 'arguments'
 ])
 
 ProcedureInfo = namedtuple('ProcedureInfo', [
@@ -172,6 +176,14 @@ class FortranVariableAnalyzer:
         procedures = []
         lines = content.split('\n')
         current_module = None
+        in_interface_block = False
+        interface_depth = 0
+        in_procedure_def = False
+        proc_buffer = ""
+        proc_start_line = 0
+
+        # This regex handles multi-line arguments
+        proc_regex = re.compile(r'^\s*(subroutine|function)\s+([a-zA-Z_]\w*)\s*(?:\((.*?)\))?', re.IGNORECASE | re.DOTALL)
 
         for i, line in enumerate(lines, 1):
             line_clean = self.clean_line(line)
@@ -187,25 +199,79 @@ class FortranVariableAnalyzer:
                 current_module = None
                 continue
 
-            # Find procedure starts
-            proc_match = re.match(r'^\s*(subroutine|function)\s+(\w+)\s*(\([^)]*\))?', line_lower)
-            if proc_match:
-                proc_type = proc_match.group(1)
-                proc_name = proc_match.group(2)
-                arguments = proc_match.group(3) if proc_match.group(3) else '()'
+            # Track interface blocks to skip them
+            if re.match(r'^\s*interface\b', line_lower):
+                in_interface_block = True
+                interface_depth += 1
+                continue
+            
+            if re.match(r'^\s*end\s+interface\b', line_lower):
+                interface_depth -= 1
+                if interface_depth == 0:
+                    in_interface_block = False
+                continue
 
-                # Find the end of this procedure
-                end_line = self.find_procedure_end(lines, i, proc_type, proc_name)
+            # Skip procedures inside interface blocks
+            if in_interface_block:
+                continue
 
-                procedures.append(ProcedureInfo(
-                    name=proc_name,
-                    type=proc_type,
-                    start_line=i,
-                    end_line=end_line,
-                    module=current_module,
-                    arguments=arguments,
-                    calls=[] # Initialize calls list
-                ))
+            # Handle procedure definitions with continuations
+            if not in_procedure_def and re.match(r'^\s*(subroutine|function)\s+([a-zA-Z_]\w*)', line_clean, re.IGNORECASE):
+                in_procedure_def = True
+                proc_start_line = i
+                proc_buffer = line_clean.rstrip('&').rstrip()
+            elif in_procedure_def and line_clean.strip():
+                # Append continued lines
+                proc_buffer += ' ' + line_clean.lstrip('&').strip()
+            
+            # Check if procedure definition is complete (no continuation or found closing paren)
+            if in_procedure_def and (not line_clean.endswith('&') or ')' in line_clean):
+                in_procedure_def = False
+                proc_match = proc_regex.match(proc_buffer)
+                
+                if proc_match:
+                    proc_type = proc_match.group(1).lower()
+                    proc_name = proc_match.group(2).lower()
+                    arg_string = proc_match.group(3)
+
+                    # Parse arguments more carefully
+                    arguments = []
+                    if arg_string:
+                        # Clean up argument string
+                        arg_string_clean = arg_string.replace('&', ' ').replace('\n', ' ').strip()
+                        # Split by comma, respecting parentheses
+                        arg_parts = self.smart_split(arg_string_clean, ',')
+                        
+                        for arg_part in arg_parts:
+                            arg_part = arg_part.strip()
+                            if not arg_part:
+                                continue
+                            
+                            # Extract argument name (might have dimensions)
+                            arg_name_match = re.match(r'^(\w+)', arg_part)
+                            if arg_name_match:
+                                arg_name = arg_name_match.group(1).lower()
+                                # Skip if it's a keyword that might appear in complex declarations
+                                if arg_name not in ['real', 'integer', 'character', 'logical', 'type', 'class', 'double', 'precision']:
+                                    arguments.append(ArgumentInfo(
+                                        name=arg_name,
+                                        intent='UNKNOWN',
+                                        type_info=''
+                                    ))
+
+                    # Find the end of this procedure
+                    end_line = self.find_procedure_end(lines, proc_start_line, proc_type, proc_name)
+
+                    procedures.append(ProcedureInfo(
+                        name=proc_name,
+                        type=proc_type,
+                        start_line=proc_start_line,
+                        end_line=end_line,
+                        module=current_module,
+                        arguments=arguments,
+                        calls=[]
+                    ))
+                proc_buffer = ""  # Reset buffer
 
         return procedures
 
@@ -226,7 +292,7 @@ class FortranVariableAnalyzer:
             end_match = re.match(r'^\s*end\s*(subroutine|function)?(\s+(\w+))?\s*$', line_lower)
             if end_match:
                 end_type = end_match.group(1)
-                end_name = end_match.group(3)
+                end_name = end_match.group(3) if end_match.group(3) else ''
 
                 # If it's a generic 'end' or matches our procedure
                 if (not end_type or end_type == proc_type) and \
@@ -258,29 +324,33 @@ class FortranVariableAnalyzer:
         # Analyze file-level and procedure-level content
         current_module = None
         current_procedure = None
+        in_interface_block = False
+        interface_depth = 0
         
         line_buffer = ""
         line_idx = 0
         start_line_num = 1
+        
         while line_idx < len(lines):
-            i = line_idx + 1
             original_line = lines[line_idx]
-            line_idx += 1
-
+            
+            # Track where multi-line statements start
             if not line_buffer:
-                start_line_num = i
+                start_line_num = line_idx + 1
 
-            # Handle line continuations correctly
+            # Handle line continuations
             clean_original = self.clean_line(original_line)
             if clean_original.endswith('&'):
                 line_buffer += clean_original[:-1].rstrip() + " "
+                line_idx += 1
                 continue
             else:
                 line_buffer += clean_original
 
-            line_clean = line_buffer
-            line_buffer = "" # Reset buffer
+            line_clean = line_buffer.strip()
+            line_buffer = ""  # Reset buffer
             line_lower = line_clean.lower()
+            line_idx += 1
 
             # Skip empty lines
             if not line_clean:
@@ -290,7 +360,6 @@ class FortranVariableAnalyzer:
             module_match = re.match(r'^\s*module\s+(\w+)', line_lower)
             if module_match and not line_lower.startswith('end module'):
                 current_module = module_match.group(1)
-                current_procedure = None
                 continue
 
             if re.match(r'^\s*end\s+module', line_lower):
@@ -298,27 +367,32 @@ class FortranVariableAnalyzer:
                 current_procedure = None
                 continue
 
-            # Track procedure context
-            proc_match = re.match(r'^\s*(subroutine|function)\s+(\w+)', line_lower)
-            if proc_match:
-                proc_name = proc_match.group(2)
-                # Find the corresponding procedure info. The line number check is removed
-                # because parse_procedures doesn't handle continuations, but the main
-                # loop does, causing a mismatch in start_line_num.
-                for proc in procedures:
-                    if proc.name.lower() == proc_name:
-                        # This assumes procedure names are unique within a file, which is a
-                        # reasonable assumption for a first-pass fix.
-                        current_procedure = proc
-                        break
+            # Track interface blocks
+            if re.match(r'^\s*interface\b', line_lower) and not re.match(r'^\s*end\s+interface', line_lower):
+                in_interface_block = True
+                interface_depth += 1
+                continue
+            
+            if re.match(r'^\s*end\s+interface\b', line_lower):
+                interface_depth -= 1
+                if interface_depth == 0:
+                    in_interface_block = False
                 continue
 
-            # Check if we're at the end of a procedure
-            if current_procedure and start_line_num >= current_procedure.end_line:
-                current_procedure = None
+            # Skip parsing inside interface blocks
+            if in_interface_block:
+                continue
 
-            # Determine analysis scope (file-level vs procedure-level)
-            scope_key = self.get_scope_key(filename, current_procedure)
+            # Find current procedure based on line number
+            current_procedure = None
+            for proc in procedures:
+                if proc.start_line <= start_line_num <= proc.end_line:
+                    current_procedure = proc
+                    break
+
+            # Skip the procedure definition line itself
+            if current_procedure and start_line_num == current_procedure.start_line:
+                continue
 
             # Parse USE statements
             use_match = re.match(r'^\s*use\s+(\w+)(?:\s*,\s*only\s*:\s*(.+))?', line_lower, re.DOTALL)
@@ -326,28 +400,79 @@ class FortranVariableAnalyzer:
                 module_name = use_match.group(1)
                 only_list = use_match.group(2) if use_match.group(2) else 'all'
                 if only_list != 'all':
+                    # Clean up the only list
                     only_list = ' '.join(only_list.split())
 
                 if current_procedure:
-                    self.procedure_use_statements[filename][current_procedure.name].append((module_name, only_list, start_line_num))
+                    self.procedure_use_statements[filename][current_procedure.name].append(
+                        (module_name, only_list, start_line_num))
                 else:
                     self.use_statements[filename].append((module_name, only_list, start_line_num))
                 continue
 
+            # Parse INTENT statements for procedure arguments
+            if current_procedure:
+                # Look for intent declarations (both inline and separate)
+                intent_pattern = r'intent\s*\(\s*(in|out|inout)\s*\)'
+                intent_matches = re.finditer(intent_pattern, line_lower)
+                
+                for intent_match in intent_matches:
+                    intent = intent_match.group(1).upper()
+                    
+                    # Find variables with this intent on this line
+                    # Look for :: followed by variable list
+                    var_list_match = re.search(r'::\s*(.+)', line_clean[intent_match.end():])
+                    if not var_list_match:
+                        # Try looking before the intent
+                        var_list_match = re.search(r'^\s*([^:]+?)\s*,\s*intent', line_lower)
+                    
+                    if var_list_match:
+                        var_string = var_list_match.group(1)
+                        var_names = []
+                        
+                        # Parse variable names from the list
+                        var_parts = self.smart_split(var_string, ',')
+                        for var_part in var_parts:
+                            var_part = var_part.strip()
+                            # Extract just the variable name
+                            var_name_match = re.match(r'^(\w+)', var_part)
+                            if var_name_match:
+                                var_names.append(var_name_match.group(1).lower())
+                        
+                        # Update the arguments in the procedure info
+                        updated_args = []
+                        for arg in current_procedure.arguments:
+                            if arg.name in var_names:
+                                updated_args.append(arg._replace(intent=intent))
+                            else:
+                                updated_args.append(arg)
+                        
+                        # Update the procedure info
+                        proc_list = self.file_procedures[filename]
+                        for idx, proc in enumerate(proc_list):
+                            if proc.name == current_procedure.name and proc.start_line == current_procedure.start_line:
+                                new_proc_info = proc._replace(arguments=updated_args)
+                                proc_list[idx] = new_proc_info
+                                current_procedure = new_proc_info
+                                break
+
             # Parse variable declarations
             var_infos = self.parse_variable_declaration(line_clean, start_line_num, current_module or 'local')
             if current_procedure:
-                self.procedure_variables[filename][current_procedure.name].extend(var_infos)
+                # Filter out variables that are procedure arguments
+                arg_names = {arg.name for arg in current_procedure.arguments}
+                var_infos = [v for v in var_infos if v.name not in arg_names]
+                if var_infos:
+                    self.procedure_variables[filename][current_procedure.name].extend(var_infos)
             else:
                 self.file_variables[filename].extend(var_infos)
                 # If we are in a module but not a procedure, these are global variables
-                if current_module:
+                if current_module and not in_interface_block:
                     for var_info in var_infos:
                         if var_info.name not in self.global_variables:
                             self.global_variables[var_info.name] = var_info
                         if var_info.name not in self.modules[current_module]:
                             self.modules[current_module].append(var_info.name)
-
 
             # Parse assignments
             assignments = self.parse_assignments(line_clean, start_line_num, filename)
@@ -365,7 +490,7 @@ class FortranVariableAnalyzer:
 
             # Parse procedure calls
             if current_procedure:
-                calls = self.parse_procedure_calls(line_clean, start_line_num)
+                calls = self.parse_procedure_calls(line_clean, start_line_num, filename, current_procedure.name)
                 self.procedure_calls[filename][current_procedure.name].extend(calls)
 
     def get_scope_key(self, filename: str, procedure: Optional[ProcedureInfo]) -> str:
@@ -386,6 +511,10 @@ class FortranVariableAnalyzer:
             line_lower.startswith('contains') or line_lower.startswith('use') or
             line_lower.startswith('private') or line_lower.startswith('public') or
             line_lower.startswith('procedure') or line_lower.startswith('class')):
+            return result
+        
+        # In parse_variable_declaration, add a check to skip interface parameters:
+        if re.match(r'^\s*interface\b', line_lower):
             return result
 
         try:
@@ -673,108 +802,256 @@ class FortranVariableAnalyzer:
         return 'VARIABLE_ASSIGNMENT'
 
     def parse_variable_reads(self, line: str, line_num: int, filename: str) -> List[Tuple[str, int, str]]:
-        """Parse variable reads (usage) from a line - improved version"""
+        """Parse variable reads (usage) from a line with better procedure name handling."""
         reads = []
         line_clean = line.strip()
-
-        # Skip empty lines and comments
-        if not line_clean or line_clean.startswith('!'):
+        
+        # Skip declarations, interface blocks, etc.
+        if not line_clean or re.match(r'^\s*(interface|end\s+interface|contains|implicit|subroutine|function|module|program)', line_clean.lower()):
             return reads
 
-        # Skip certain Fortran constructs
-        line_lower = line_clean.lower()
-        skip_patterns = [
-            r'^\s*use\s+',
-            r'^\s*implicit\s+',
-            r'^\s*parameter\s*\(',
-            r'^\s*dimension\s+',
-            r'^\s*allocatable\s+',
-            r'^\s*intent\s*\(',
-            r'^\s*(subroutine|function|end|contains|module|program)',
-            r'^\s*(public|private|save)',
-        ]
-
-        for pattern in skip_patterns:
-            if re.search(pattern, line_lower):
-                return reads
-
+        # For CALL statements, don't count the procedure name as a variable read
+        if re.search(r'\bcall\s+\w+', line_clean.lower()):
+            # Extract just the part inside the parentheses
+            match = re.search(r'\bcall\s+\w+\s*\((.*)\)', line_clean.lower())
+            search_text = match.group(1) if match else ""
         # For assignment lines, only look at RHS
-        if '=' in line_clean and not line_lower.startswith('if'):
+        elif '=' in line_clean and not line_clean.lower().strip().startswith('if'):
             # Split on first = to get RHS
-            parts = line_clean.split('=', 1)
-            if len(parts) > 1:
-                search_text = parts[1]
-            else:
-                return reads
+            search_text = line_clean.split('=', 1)[1]
         else:
             search_text = line_clean
 
-        # Extract variables more carefully
-        # Remove function calls first
-        search_text = re.sub(r'\b\w+\s*\([^)]*\)', '', search_text)
-
+        # Find potential procedure names (anything followed by parentheses)
+        proc_pattern = r'\b([a-zA-Z_]\w*)\s*\('
+        proc_names = {match.group(1).lower() for match in re.finditer(proc_pattern, search_text.lower())}
+        
         # Find variable names
         var_pattern = r'\b([a-zA-Z_]\w*)\b'
-
         fortran_keywords = {
-            'if', 'then', 'else', 'endif', 'end', 'do', 'while', 'call',
-            'function', 'subroutine', 'return', 'stop', 'print', 'write',
-            'read', 'open', 'close', 'sqrt', 'exp', 'log', 'sin', 'cos',
-            'abs', 'max', 'min', 'real', 'integer', 'logical', 'character',
-            'parameter', 'dimension', 'allocatable', 'intent', 'kind',
-            'selected_real_kind', 'selected_int_kind', 'true', 'false',
-            'dp', 'sp', 'only', 'use', 'implicit', 'none', 'save',
-            'public', 'private', 'module', 'program', 'contains',
-            'where', 'forall', 'select', 'case', 'cycle', 'exit',
-            '__date__', '__file__', '__line__', '__time__', '_dp'
+            'if', 'then', 'else', 'endif', 'end', 'do', 'while', 'call', 'exit', 'cycle',
+            'function', 'subroutine', 'return', 'stop', 'print', 'write', 'save',
+            'read', 'open', 'close', 'sqrt', 'exp', 'log', 'sin', 'cos', 'tan',
+            'abs', 'max', 'min', 'real', 'integer', 'logical', 'character', 'dp',
+            'in', 'out', 'inout', 'intent', 'parameter', 'allocatable', 'dimension',
+            'true', 'false', 'and', 'or', 'not', 'eq', 'ne', 'gt', 'lt', 'ge', 'le'
         }
 
         for match in re.finditer(var_pattern, search_text):
             var_name = match.group(1).lower()
 
-            # Skip keywords, very short names, and obvious non-variables
-            if (var_name not in fortran_keywords and
-                len(var_name) > 1 and
-                not var_name.startswith('_') and
+            # Skip keywords, procedure names, and obvious non-variables
+            if (var_name not in fortran_keywords and 
+                var_name not in proc_names and
                 not var_name.isdigit()):
                 reads.append((var_name, line_num, 'VARIABLE_READ'))
 
         return reads
 
-    def parse_procedure_calls(self, line: str, line_num: int) -> List[CallInfo]:
-        """Parse procedure calls from a line."""
+    def parse_procedure_calls(self, line: str, line_num: int, filename: str, proc_name: str) -> List[CallInfo]:
+        """Parse procedure calls from a line with improved declaration filtering."""
         calls = []
         line_clean = line.strip()
         line_lower = line_clean.lower()
 
-        # Pattern for 'call subroutine_name(...)'
-        call_match = re.match(r'^\s*call\s+([a-zA-Z_]\w*)', line_lower)
-        if call_match:
+        # Skip empty lines and comments
+        if not line_clean or line_clean.startswith('!'):
+            return calls
+
+        # Comprehensive detection of declaration lines to skip
+        declaration_patterns = [
+            r'^\s*(integer|real|double\s+precision|complex|logical|character|type)\s*[\(\::]',
+            r'^\s*\w+\s*,\s*(intent|dimension|parameter|allocatable|pointer|target|save)',
+            r'^\s*(intent|dimension|parameter|allocatable|pointer|target|save)\s*[\(\::]',
+            r'^\s*interface\b',
+            r'^\s*end\s+interface\b',
+            r'^\s*contains\b',
+            r'^\s*implicit\s+none\b',
+            r'^\s*use\s+\w+',
+            r'^\s*module\s+\w+',
+            r'^\s*program\s+\w+',
+            r'^\s*subroutine\s+\w+',
+            r'^\s*function\s+\w+',
+            r'^\s*end\s+(subroutine|function|program|module)',
+            r'^\s*\w+\s*::\s*',  # Any variable with :: declaration syntax
+        ]
+        
+        # Skip lines that match declaration patterns
+        for pattern in declaration_patterns:
+            if re.match(pattern, line_lower):
+                return calls
+
+        # Skip lines that are clearly control structures or other non-call statements
+        control_patterns = [
+            r'^\s*(if|then|else|elseif|endif|select|case|end\s+select)',
+            r'^\s*(do|enddo|end\s+do|while|forall|where)',
+            r'^\s*(stop|return|cycle|exit)',
+            r'^\s*(write|print|read|open|close)\s*[\(\*]',
+            r'^\s*\w+\s*=',  # Assignment statements
+        ]
+        
+        for pattern in control_patterns:
+            if re.match(pattern, line_lower):
+                return calls
+
+        # Find CALL statements (subroutine calls)
+        call_matches = re.finditer(r'\bcall\s+([a-zA-Z_]\w*)\s*(?:\((.*?)\))?', line_lower, re.DOTALL)
+        for call_match in call_matches:
+            called_name = call_match.group(1)
+            arg_string = call_match.group(2) if call_match.group(2) else ""
+            
+            arguments = self.smart_split(arg_string, ',') if arg_string else []
+            
             calls.append(CallInfo(
-                called_name=call_match.group(1),
+                called_name=called_name,
                 line_num=line_num,
-                call_type='subroutine'
+                call_type='subroutine',
+                arguments=[arg.strip() for arg in arguments if arg.strip()]
             ))
 
-        # Pattern for function calls: name(...)
-        # This is a simple heuristic and may misidentify array access as function calls.
-        # It avoids matching names on the LHS of an assignment.
+        # For function calls, be much more restrictive
+        # Only look for function calls in assignment RHS or other expression contexts
         search_text = line_clean
-        if '=' in search_text and not search_text.lstrip().lower().startswith('if'):
-             search_text = search_text.split('=', 1)[1]
-
-        func_matches = re.findall(r'\b([a-zA-Z_]\w*)\s*\(', search_text)
-        if func_matches:
-            # A simple filter to avoid common intrinsic functions
-            fortran_intrinsics = {'dble', 'real', 'int', 'abs', 'mod', 'max', 'min', 'sin', 'cos', 'tan', 'exp', 'log', 'sqrt', 'trim', 'adjustl', 'len', 'anint', 'log10', 'dabs', 'dsin', 'allocated'}
-            for func_name in func_matches:
-                if func_name.lower() not in fortran_intrinsics:
+        
+        # If it's an assignment, only look at the RHS
+        if '=' in line_clean and not line_lower.strip().startswith('if'):
+            parts = line_clean.split('=', 1)
+            if len(parts) == 2:
+                search_text = parts[1]
+        
+        # More restrictive function call pattern that avoids type declarations
+        # This pattern looks for function-like calls but excludes common declaration contexts
+        func_pattern = r'(?<![a-zA-Z_])(assert_eq|cumsum|iminlocdp|arth|maxval|minval|max|min|abs|size|shape|allocated|present)\s*\('
+        
+        # Find intrinsic/library function calls that we know are functions
+        known_functions = {
+            'assert_eq', 'cumsum', 'iminlocdp', 'arth', 'maxval', 'minval', 
+            'max', 'min', 'abs', 'size', 'shape', 'allocated', 'present',
+            'sqrt', 'exp', 'log', 'sin', 'cos', 'tan', 'real', 'int', 'nint'
+        }
+        
+        # Look for known function patterns
+        for func_match in re.finditer(func_pattern, search_text, re.IGNORECASE):
+            func_name = func_match.group(1).lower()
+            if func_name in known_functions:
+                # Find the arguments for this function call
+                start_pos = func_match.end() - 1  # Position of opening parenthesis
+                arg_string = self.extract_parenthesized_content(search_text, start_pos)
+                if arg_string is not None:
+                    arguments = self.smart_split(arg_string, ',') if arg_string else []
                     calls.append(CallInfo(
                         called_name=func_name,
                         line_num=line_num,
-                        call_type='function'
+                        call_type='function',
+                        arguments=[arg.strip() for arg in arguments if arg.strip()]
                     ))
+
         return calls
+
+    def extract_parenthesized_content(self, text: str, start_pos: int) -> Optional[str]:
+        """Extract content between balanced parentheses starting at start_pos."""
+        if start_pos >= len(text) or text[start_pos] != '(':
+            return None
+        
+        paren_count = 0
+        content_start = start_pos + 1
+        
+        for i in range(start_pos, len(text)):
+            if text[i] == '(':
+                paren_count += 1
+            elif text[i] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    return text[content_start:i]
+        
+        return None  # Unbalanced parentheses
+    
+    def correlate_call_arguments(self, call_info: CallInfo, called_proc_info: ProcedureInfo) -> List[Tuple[str, str, str]]:
+        """
+        Correlate actual arguments in a call with dummy arguments in procedure definition.
+        Returns: [(actual_arg, dummy_arg, intent), ...]
+        """
+        correlations = []
+        
+        try:
+            # Match actual arguments with dummy arguments by position
+            for i, actual_arg in enumerate(call_info.arguments):
+                if i < len(called_proc_info.arguments):
+                    dummy_arg = called_proc_info.arguments[i]
+                    
+                    # Extract variable name from actual argument (remove array indices, etc.)
+                    actual_var = re.match(r'^(\w+)', actual_arg.strip())
+                    if actual_var and hasattr(dummy_arg, 'name') and hasattr(dummy_arg, 'intent'):
+                        correlations.append((
+                            actual_var.group(1).lower(),
+                            dummy_arg.name,
+                            dummy_arg.intent
+                        ))
+        except Exception as e:
+            print(f"Debug: Error in correlate_call_arguments: {e}")
+            return []
+        
+        return correlations
+    
+    def find_procedure_definition(self, proc_name: str) -> Optional[ProcedureInfo]:
+        """Find the definition of a procedure by name across all analyzed files."""
+        proc_name_lower = proc_name.lower()
+        
+        for filename, procedures in self.file_procedures.items():
+            for proc in procedures:
+                if proc.name == proc_name_lower:
+                    return proc
+        
+        return None
+    
+    def analyze_indirect_modifications(self, filename: str, proc_name: str):
+        """Detect global variables potentially modified through procedure calls."""
+        indirect_mods = []
+        
+        try:
+            if filename not in self.procedure_calls or proc_name not in self.procedure_calls[filename]:
+                return indirect_mods
+            
+            calls = self.procedure_calls[filename][proc_name]
+            
+            for call in calls:
+                try:
+                    # Find the definition of the called procedure
+                    called_proc = self.find_procedure_definition(call.called_name)
+                    
+                    if called_proc:
+                        # Correlate arguments
+                        correlations = self.correlate_call_arguments(call, called_proc)
+                        
+                        for correlation in correlations:
+                            try:
+                                # Ensure we have a 3-tuple
+                                if len(correlation) == 3:
+                                    actual_arg, dummy_arg, intent = correlation
+                                    
+                                    # Check if actual argument is a global variable
+                                    if actual_arg in self.global_variables:
+                                        # Check if it can be modified (OUT or INOUT)
+                                        if intent in ['OUT', 'INOUT']:
+                                            indirect_mods.append({
+                                                'variable': actual_arg,
+                                                'call_line': call.line_num,
+                                                'called_proc': call.called_name,
+                                                'dummy_arg': dummy_arg,
+                                                'intent': intent
+                                            })
+                            except Exception as e:
+                                print(f"Debug: Error processing correlation {correlation}: {e}")
+                                continue
+                except Exception as e:
+                    print(f"Debug: Error processing call {call.called_name}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"Debug: Error in analyze_indirect_modifications: {e}")
+            return []
+        
+        return indirect_mods
 
     def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto'):
         """Generate comprehensive analysis report with procedure-level analysis"""
@@ -815,7 +1092,7 @@ class FortranVariableAnalyzer:
         self._generate_global_summary(add_line, show_all_globals, use_color)
 
         # File-by-file analysis with procedure breakdown
-        for filename in sorted(self.file_variables.keys()):
+        for filename in sorted(self.file_procedures.keys()):
             # Filtering logic for --show-only-file
             if show_only_file and Path(filename).name not in show_only_file:
                 continue
@@ -890,7 +1167,13 @@ class FortranVariableAnalyzer:
 
                         if proc.module:
                             add_line(f"Module: {proc.module}", 2)
-                        add_line(f"Arguments: {proc.arguments}", 2)
+                        
+                        # Format arguments with intent
+                        arg_parts = []
+                        for arg in proc.arguments:
+                            intent_str = f"[{arg.intent}]" if arg.intent != 'UNKNOWN' else ""
+                            arg_parts.append(f"{arg.name}{intent_str}")
+                        add_line(f"Arguments: {', '.join(arg_parts)}", 2)
                         add_line()
 
                         # Procedure-level USE statements
@@ -977,42 +1260,29 @@ class FortranVariableAnalyzer:
                             calls = self.procedure_calls[filename][proc.name]
                             if calls:
                                 add_line("Procedure Calls:", 2, color=Color.CYAN)
-                                called_procs_info = defaultdict(lambda: {'reads': set(), 'modifies': set()})
-
-                                for call in calls:
-                                    called_name_lower = call.called_name.lower()
-                                    called_filename = proc_to_file_map.get(called_name_lower)
-
-                                    if called_filename:
-                                        # Globals Read in called procedure
-                                        called_reads = self.procedure_reads.get(called_filename, {}).get(called_name_lower, [])
-                                        read_globals = {var.lower() for var, _, _ in called_reads if var.lower() in global_var_names_lower}
-                                        called_procs_info[called_name_lower]['reads'].update(read_globals)
-
-                                        # Globals Modified in called procedure
-                                        called_assignments = self.procedure_assignments.get(called_filename, {}).get(called_name_lower, [])
-                                        modified_globals = {assign.variable.lower() for assign in called_assignments if assign.variable.lower() in global_var_names_lower}
-                                        called_procs_info[called_name_lower]['modifies'].update(modified_globals)
                                 
-                                for called_name, data_flow in sorted(called_procs_info.items()):
-                                    flow_parts = []
-                                    if data_flow['modifies']:
-                                        mod_str = f"Modifies: {', '.join(sorted(list(data_flow['modifies'])))}"
-                                        if use_color:
-                                            flow_parts.append(f"{Color.FAIL}{mod_str}{Color.ENDC}")
-                                        else:
-                                            flow_parts.append(mod_str)
+                                # Group calls by called procedure name
+                                call_counts = defaultdict(list)
+                                for call in calls:
+                                    call_counts[call.called_name].append(call)
+                                
+                                # Display each called procedure with its details
+                                for called_name, call_list in sorted(call_counts.items()):
+                                    call_count = len(call_list)
+                                    call_type = call_list[0].call_type
+                                    first_line = call_list[0].line_num
                                     
-                                    if data_flow['reads']:
-                                        read_str = f"Reads: {', '.join(sorted(list(data_flow['reads'])))}"
-                                        if use_color:
-                                            flow_parts.append(f"{Color.WARNING}{read_str}{Color.ENDC}")
-                                        else:
-                                            flow_parts.append(read_str)
+                                    # Show basic call info
+                                    add_line(f"- {called_name} ({call_type}) called {call_count} time(s), first at line {first_line}", 3)
                                     
-                                    flow_display = f" ({'; '.join(flow_parts)})" if flow_parts else ""
-                                    add_line(f"- {called_name}{flow_display}", 3)
-
+                                    # For enhanced reports, show argument patterns
+                                    if enhanced and call_count <= 3:  # Only show details for a few calls
+                                        for call in call_list[:3]:
+                                            args_str = ', '.join(call.arguments[:3])  # Show first 3 arguments
+                                            if len(call.arguments) > 3:
+                                                args_str += ', ...'
+                                            add_line(f"  Line {call.line_num}: {called_name}({args_str})", 4)
+                                
                                 add_line()
 
                         # Global variable usage within the procedure (already calculated above)
@@ -1045,7 +1315,7 @@ class FortranVariableAnalyzer:
             report_text_no_color = re.sub(r'\033\[[0-9;]*m', '', report_text)
             with open(output_file, 'w') as f:
                 f.write(report_text_no_color)
-            cprint(f"Report written to {output_file}", Color.GREEN)
+            cprint(f"Report written to {output_file}", Color.GREEN, force_color=color_mode!='never')
         else:
             print(report_text)
 
@@ -1256,26 +1526,25 @@ class FortranVariableAnalyzer:
         # Collect all assignments and reads from both file and procedure level
         all_assigned_vars = set()
         all_read_vars = set()
+        all_calls = defaultdict(list)
 
-        # File-level
-        for assignments in self.file_assignments.values():
-            for assignment in assignments:
-                all_assigned_vars.add(assignment.variable.lower())
-
-        for reads in self.file_reads.values():
-            for var_name, _, _ in reads:
-                all_read_vars.add(var_name.lower())
-
+        # File-level data is not relevant for this summary, focus on procedures
         # Procedure-level
-        for filename_procedures in self.procedure_assignments.values():
-            for procedure_assignments in filename_procedures.values():
-                for assignment in procedure_assignments:
-                    all_assigned_vars.add(assignment.variable.lower())
+        for filename, procs in self.file_procedures.items():
+            for proc in procs:
+                # Assignments
+                if filename in self.procedure_assignments and proc.name in self.procedure_assignments[filename]:
+                    for assignment in self.procedure_assignments[filename][proc.name]:
+                        all_assigned_vars.add(assignment.variable.lower())
+                # Reads
+                if filename in self.procedure_reads and proc.name in self.procedure_reads[filename]:
+                    for var_name, _, _ in self.procedure_reads[filename][proc.name]:
+                        all_read_vars.add(var_name.lower())
+                # Calls
+                if filename in self.procedure_calls and proc.name in self.procedure_calls[filename]:
+                    for call in self.procedure_calls[filename][proc.name]:
+                        all_calls[call.called_name.lower()].append(f"{proc.name} (in {Path(filename).name})")
 
-        for filename_procedures in self.procedure_reads.values():
-            for procedure_reads in filename_procedures.values():
-                for var_name, _, _ in procedure_reads:
-                    all_read_vars.add(var_name.lower())
 
         global_var_names = {name.lower() for name in self.global_variables.keys()}
 
@@ -1312,7 +1581,9 @@ class FortranVariableAnalyzer:
                 if filename in self.procedure_calls and proc.name in self.procedure_calls[filename]:
                     calls = self.procedure_calls[filename][proc.name]
                     for call in calls:
-                        reverse_call_map[call.called_name.lower()].append(f"{proc.name} (in {Path(filename).name})")
+                        # Filter out calls to variables
+                        if call.called_name.lower() not in self.global_variables and not re.match(r'^\d', call.called_name):
+                            reverse_call_map[call.called_name.lower()].append(f"{proc.name} (in {Path(filename).name})")
 
         # Sort by procedure name
         sorted_called_procs = sorted(reverse_call_map.keys())
@@ -1336,12 +1607,206 @@ class FortranVariableAnalyzer:
             for caller in callers:
                 add_line(caller, 2)
             add_line()
+    
+    def analyze_global_variable_lifecycle(self, var_name: str):
+        """Generate a complete lifecycle report for a global variable."""
+        
+        var_lower = var_name.lower()
+        
+        # Find the actual key in global_variables that matches (case-insensitive)
+        actual_var_key = None
+        for key in self.global_variables.keys():
+            if key.lower() == var_lower:
+                actual_var_key = key
+                break
+        
+        if actual_var_key is None:
+            return f"Variable '{var_name}' not found in global variables."
+        
+        
+        events = []
+        
+        try:
+            # Find declaration using the actual key
+            var_info = self.global_variables[actual_var_key]
+
+            
+            module_location = self.module_locations.get(var_info.module, 'unknown')
+            
+            # Build the dictionary step by step
+            event_dict = {}
+            event_dict['type'] = 'DECLARED'
+            event_dict['file'] = module_location
+            event_dict['line'] = var_info.line_num
+            event_dict['context'] = f"Module {var_info.module}"
+            event_dict['details'] = f"{var_info.type} {var_info.name}"
+                     
+            events.append(event_dict)
+ 
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"Error processing variable declaration: {e}"
+        
+        
+        # Find all direct reads and writes
+        proc_count = 0
+        for filename, procs in self.file_procedures.items():
+            for proc in procs:
+                proc_count += 1
+                
+                try:
+                    # Direct assignments
+                    if filename in self.procedure_assignments and proc.name in self.procedure_assignments[filename]:
+                        assignments = self.procedure_assignments[filename][proc.name]
+                        
+                        for i, assignment in enumerate(assignments):
+                            try:
+                                if assignment.variable.lower() == var_lower:
+                                    
+                                    # Safely handle potentially None values
+                                    rhs = str(assignment.rhs) if assignment.rhs is not None else ""
+                                    context = str(assignment.context) if assignment.context is not None else str(assignment.variable)
+                                    assignment_type = str(assignment.assignment_type) if assignment.assignment_type is not None else "UNKNOWN"
+                                    
+                                    rhs_display = rhs[:50] + "..." if len(rhs) > 50 else rhs
+                                    
+                                    assignment_event = {}
+                                    assignment_event['type'] = 'MODIFIED_DIRECT'
+                                    assignment_event['file'] = str(filename)
+                                    assignment_event['procedure'] = str(proc.name)
+                                    assignment_event['line'] = int(assignment.line_num)
+                                    assignment_event['context'] = f"{context} = {rhs_display}"
+                                    assignment_event['assignment_type'] = assignment_type
+                                    
+                                    events.append(assignment_event)
+                                    
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
+                                continue
+                    
+                    # Direct reads
+                    if filename in self.procedure_reads and proc.name in self.procedure_reads[filename]:
+                        reads = self.procedure_reads[filename][proc.name]
+                        
+                        for i, read_item in enumerate(reads):
+                            try:
+                                if len(read_item) >= 3:
+                                    var, line_num, read_type = read_item[0], read_item[1], read_item[2]
+                                    if str(var).lower() == var_lower:
+                                        
+                                        read_event = {}
+                                        read_event['type'] = 'READ'
+                                        read_event['file'] = str(filename)
+                                        read_event['procedure'] = str(proc.name)
+                                        read_event['line'] = int(line_num)
+                                        read_event['context'] = 'Variable used in expression'
+                                        
+                                        events.append(read_event)
+                                        
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
+                                continue
+                    
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        
+        # Sort events by file and line number
+        try:
+            events.sort(key=lambda x: (x.get('file', ''), x.get('line', 0)))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+        return self.generate_variable_diary_report(actual_var_key, events)
+
+    def list_global_variables_matching(self, partial_name: str) -> List[str]:
+        """Find global variables that match a partial name (case-insensitive)."""
+        partial_lower = partial_name.lower()
+        matches = []
+        for var_name in self.global_variables.keys():
+            if partial_lower in var_name.lower():
+                matches.append(var_name)
+        return sorted(matches)
+    
+    def generate_variable_diary_report(self, var_name: str, events: List[Dict]) -> str:
+        """Generate a formatted diary report for a variable."""
+        lines = []
+        lines.append(f"VARIABLE LIFECYCLE DIARY: {var_name}")
+        lines.append("=" * 60)
+        lines.append("")  # FIX: was lines.append()
+        
+        if not events:
+            lines.append("No events found for this variable.")
+            return '\n'.join(lines)
+        
+        for event in events:
+            try:
+                event_type = event.get('type', 'UNKNOWN')
+                file_name = event.get('file', 'unknown')
+                line_num = event.get('line', 0)
+                
+                if event_type == 'DECLARED':
+                    lines.append(f"📋 DECLARED in {file_name} at line {line_num}")
+                    lines.append(f"   {event.get('details', 'No details')}")
+                
+                elif event_type == 'MODIFIED_DIRECT':
+                    procedure = event.get('procedure', 'unknown')
+                    lines.append(f"✏️  MODIFIED in {procedure}() at line {line_num}")
+                    lines.append(f"   {event.get('context', 'No context')}")
+                    lines.append(f"   Type: {event.get('assignment_type', 'UNKNOWN')}")
+                
+                elif event_type == 'MODIFIED_INDIRECT':
+                    procedure = event.get('procedure', 'unknown')
+                    lines.append(f"⚠️  POTENTIALLY MODIFIED in {procedure}() at line {line_num}")
+                    lines.append(f"   {event.get('context', 'No context')}")
+                
+                elif event_type == 'READ':
+                    procedure = event.get('procedure', 'unknown')
+                    lines.append(f"👁️  READ in {procedure}() at line {line_num}")
+                
+                lines.append("")  # FIX: was lines.append()
+                
+            except Exception as e:
+                lines.append(f"Error processing event: {e}")
+                lines.append("")
+        
+        return '\n'.join(lines)
 
     def classify_variable_scope(self, var_name: str, filename: str, proc_name: Optional[str] = None) -> str:
         """Enhanced scope classification"""
         var_lower = var_name.lower()
 
-        # Check if it's a global variable
+        # Check if it's a procedure argument first
+        if proc_name and filename in self.file_procedures:
+            for proc in self.file_procedures[filename]:
+                if proc.name == proc_name:
+                    arg_names = [arg.name.lower() for arg in proc.arguments]
+                    if var_lower in arg_names:
+                        return "ARGUMENT"
+                    break
+
+        # Check if it's from a USE statement first
+        if proc_name and filename in self.procedure_use_statements:
+            if proc_name in self.procedure_use_statements[filename]:
+                for module, only_list, _ in self.procedure_use_statements[filename][proc_name]:
+                    if only_list == 'all':
+                        # Check if this variable is from the imported module
+                        if module in self.modules and var_lower in [v.lower() for v in self.modules[module]]:
+                            return f"IMPORTED({module})"
+                    else:
+                        # Check if variable is in the ONLY list
+                        only_vars = [v.strip().lower() for v in only_list.split(',')]
+                        if var_lower in only_vars:
+                            return f"IMPORTED({module})"
+        
+        # Then check if it's a global variable
         if var_lower in [v.lower() for v in self.global_variables.keys()]:
             return "GLOBAL"
 
@@ -1474,6 +1939,11 @@ def main():
                        help='Hide local variable declaration lists in procedures.')
     parser.add_argument('--hide-ok', action='store_true',
                        help='Hide procedures that do not read or modify any global variables.')
+    
+    # NEW: Variable diary feature
+    parser.add_argument('--trace-var', metavar='VARIABLE_NAME',
+                       help='Generate a detailed lifecycle report for a specific global variable.')
+
 
     args = parser.parse_args()
     
@@ -1497,20 +1967,10 @@ def main():
         cprint(f"Error: No Fortran files found to analyze.", Color.FAIL, force_color=args.color=='always')
         return 1
     
-    # Initialize analyzer
-    try:
-        analyzer = FortranVariableAnalyzer()
-    except Exception as e:
-        cprint(f"Error initializing analyzer: {e}", Color.FAIL, force_color=args.color=='always')
-        if args.debug:
-            import traceback
-            traceback.print_exc()
-        return 1
-
-    # Pass 1: Scan the entire codebase for global variables
+    # Initialize analyzer and run analysis (existing code)
+    analyzer = FortranVariableAnalyzer()
     analyzer.scan_directory_for_globals(codebase_path)
     
-    # Pass 2: Analyze each target input file in detail
     analyzed_count = 0
     cprint("\nStarting detailed analysis...", Color.BOLD, force_color=args.color=='always')
     for file_path in analysis_targets:
@@ -1529,7 +1989,27 @@ def main():
     
     cprint(f"\nSuccessfully analyzed {analyzed_count}/{len(analysis_targets)} files", Color.GREEN, force_color=args.color=='always')
     
-    # Generate report
+    # NEW: Handle variable diary request
+    if args.trace_var:
+        try:
+            # Debug: show what global variables contain 'h'
+            matches = analyzer.list_global_variables_matching(args.trace_var)
+            diary_report = analyzer.analyze_global_variable_lifecycle(args.trace_var)
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(diary_report)
+                cprint(f"Variable diary written to {args.output}", Color.GREEN, force_color=args.color!='never')
+            else:
+                print(diary_report)
+            return 0
+        except Exception as e:
+            cprint(f"Error generating variable diary: {e}", Color.FAIL, force_color=args.color=='always')
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            return 1
+    
+    # Generate regular report (existing code)
     try:
         analyzer.generate_report(
             args.output, 

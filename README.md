@@ -58,6 +58,12 @@ fortran-analyzer path/to/your/codebase -o analysis_report.txt
 
 # Show all global variables in the report (not just a summary)
 fortran-analyzer path/to/your/codebase --show-all-globals
+
+# Generate a detailed lifecycle "diary" for a specific global variable
+fortran-analyzer path/to/your/codebase --trace-var my_global_variable
+
+# Filter the report to only show a specific procedure
+fortran-analyzer path/to/your/codebase --show-only-proc my_subroutine
 ```
 
 ### Via wrapper script
@@ -78,6 +84,12 @@ fortran-analyzer path/to/your/codebase --show-all-globals
 - `--enhanced`: Generate enhanced report with statistics.
 - `--truncate`: Truncate long lists in the report.
 - `--debug`: Enable debug mode for more detailed error output.
+- `--color`: Control colorized output (`auto`, `always`, `never`).
+- `--show-only-file FILENAME [FILENAME ...]`: Only show analysis for specific file(s).
+- `--show-only-proc PROCNAME [PROCNAME ...]`: Only show analysis for specific procedure(s).
+- `--hide-locals`: Hide local variable declaration lists in procedures.
+- `--hide-ok`: Hide procedures that do not read or modify any global variables.
+- `--trace-var VARIABLE_NAME`: Generate a detailed lifecycle report for a specific global variable.
 
 ## Development
 
