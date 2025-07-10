@@ -79,6 +79,13 @@ class FortranVariableAnalyzer:
         self.procedure_calls = defaultdict(lambda: defaultdict(list))
         self.procedure_use_statements = defaultdict(lambda: defaultdict(list))
 
+        # Variable Dependency Tracking Structures
+        self.variable_dependencies = defaultdict(lambda: defaultdict(set))  # filename -> {var: set of vars it depends on}
+        self.assignment_chains = defaultdict(lambda: defaultdict(list))     # filename -> {var: list of (line_num, rhs_vars)}
+        self.procedure_data_flow = defaultdict(lambda: defaultdict(dict))   # filename -> {proc: {inputs, outputs, internals}}
+        self.rhs_variables = defaultdict(lambda: defaultdict(dict))         # filename -> {line_num: [vars_in_rhs]}
+
+
     def scan_directory_for_globals(self, source_dir: Path):
         """
         Pass 1: A fast scan of all files in a directory to find all module-level
@@ -504,6 +511,82 @@ class FortranVariableAnalyzer:
             if current_procedure:
                 calls = self.parse_procedure_calls(line_clean, start_line_num, filename, current_procedure.name)
                 self.procedure_calls[filename][current_procedure.name].extend(calls)
+                # After parsing the file, analyze data flow for each procedure
+        for proc in procedures:
+            self.analyze_procedure_data_flow(filename, proc.name)
+    
+    def analyze_procedure_data_flow(self, filename: str, proc_name: str):
+        """
+        For a procedure, classify variables as inputs, outputs, or internals.
+        - Inputs: Read before being written.
+        - Outputs: Written to at any point.
+        - Internals: Declared locally and not used as input/output.
+        """
+        proc_assignments = self.procedure_assignments.get(filename, {}).get(proc_name, [])
+        proc_reads = self.procedure_reads.get(filename, {}).get(proc_name, [])
+        proc_vars = self.procedure_variables.get(filename, {}).get(proc_name, [])
+        
+        # Get all variables involved in this procedure
+        assigned_vars = {a.variable.lower(): a.line_num for a in proc_assignments}
+        read_vars = defaultdict(list)
+        for r_var, r_line, _ in proc_reads:
+            read_vars[r_var.lower()].append(r_line)
+        
+        local_decls = {v.name.lower() for v in proc_vars}
+        
+        all_proc_vars = set(assigned_vars.keys()) | set(read_vars.keys())
+        
+        inputs = set()
+        outputs = set()
+
+        for var in all_proc_vars:
+            is_written = var in assigned_vars
+            is_read = var in read_vars
+
+            if is_written:
+                outputs.add(var)
+
+            if is_read:
+                # If read before first write, it's an input
+                first_write_line = assigned_vars.get(var, float('inf'))
+                first_read_line = min(read_vars[var])
+                
+                if first_read_line < first_write_line:
+                    inputs.add(var)
+
+        internals = local_decls - (inputs | outputs)
+
+        self.procedure_data_flow[filename][proc_name] = {
+            'inputs': sorted(list(inputs)),
+            'outputs': sorted(list(outputs)),
+            'internals': sorted(list(internals))
+        }
+
+    def find_dependency_chains(self, filename: str, start_var: str, max_depth: int = 10) -> List[List[str]]:
+        """
+        Build dependency chains showing how a variable depends on others.
+        Returns a list of chains, where each chain is a list of variable names.
+        """
+        chains = []
+        
+        def find_recursive(current_var: str, current_chain: List[str]):
+            # Cycle detection and depth limit
+            if current_var in current_chain or len(current_chain) > max_depth:
+                return
+
+            new_chain = current_chain + [current_var]
+            
+            dependencies = self.variable_dependencies[filename].get(current_var, set())
+            
+            if not dependencies:
+                chains.append(new_chain)
+                return
+            
+            for dep_var in dependencies:
+                find_recursive(dep_var, new_chain)
+
+        find_recursive(start_var, [])
+        return chains
 
     def get_scope_key(self, filename: str, procedure: Optional[ProcedureInfo]) -> str:
         """Generate a scope key for organizing data"""
@@ -744,7 +827,7 @@ class FortranVariableAnalyzer:
         return parts
 
     def parse_assignments(self, line: str, line_num: int, filename: str) -> List[AssignmentInfo]:
-        """Enhanced assignment parsing with better pattern detection"""
+        """Enhanced assignment parsing with better pattern detection and dependency tracking."""
         assignments = []
         line_clean = line.strip()
         line_lower = line_clean.lower()
@@ -785,8 +868,16 @@ class FortranVariableAnalyzer:
                 # Extract base variable name
                 var_name_match = re.match(r'^(\w+)', lhs)
                 if var_name_match:
-                    var_name = var_name_match.group(1)
+                    var_name = var_name_match.group(1).lower()
                     assignment_type = self.classify_assignment_enhanced(lhs, rhs, line_clean)
+
+                    # --- New Dependency Tracking Logic ---
+                    rhs_vars = self.extract_variables_from_expression(rhs)
+                    if rhs_vars:
+                        self.rhs_variables[filename][line_num] = list(rhs_vars)
+                        self.variable_dependencies[filename][var_name].update(rhs_vars)
+                        self.assignment_chains[filename][var_name].append((line_num, list(rhs_vars)))
+                    # --- End New Logic ---
 
                     assignments.append(AssignmentInfo(
                         variable=var_name,
@@ -795,6 +886,7 @@ class FortranVariableAnalyzer:
                         rhs=rhs,
                         context=lhs
                     ))
+                    # We found a match, no need to check other patterns for this line
                     break
 
         return assignments
@@ -1019,6 +1111,48 @@ class FortranVariableAnalyzer:
         
         return None  # Unbalanced parentheses
     
+    def extract_variables_from_expression(self, expression: str) -> Set[str]:
+        """
+        Extracts variable names from a Fortran expression (RHS of an assignment).
+        - Skips intrinsic functions, keywords, and literals.
+        - Handles function calls and array indexing.
+        """
+        # Fortran intrinsic functions and keywords to ignore
+        fortran_intrinsics_and_keywords = {
+            'sqrt', 'exp', 'log', 'log10', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+            'abs', 'max', 'min', 'mod', 'modulo', 'sign', 'dim', 'dble', 'int', 'nint',
+            'real', 'cmplx', 'achar', 'char', 'len', 'index', 'scan', 'verify',
+            'allocated', 'present', 'size', 'shape', 'lbound', 'ubound', 'sum',
+            'product', 'maxval', 'minval', 'maxloc', 'minloc', 'count', 'any', 'all',
+            'if', 'then', 'else', 'endif', 'do', 'while', 'call', 'exit', 'cycle',
+            'function', 'subroutine', 'return', 'stop', 'print', 'write', 'save',
+            'read', 'open', 'close', 'dp', 'in', 'out', 'inout', 'intent', 'parameter',
+            'allocatable', 'dimension', 'true', 'false', 'and', 'or', 'not', 'eq',
+            'ne', 'gt', 'lt', 'ge', 'le', 'double', 'precision', 'implicit', 'none',
+            'only', 'use', 'module', 'type', 'class'
+        }
+
+        # Pattern to find valid Fortran identifiers (variables, functions, arrays)
+        # It captures identifiers that may include '%' for derived types.
+        identifier_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*(?:%[a-zA-Z_][a-zA-Z0-9_]*)*)\b'
+        
+        variables = set()
+        
+        # Find all potential identifiers in the expression
+        potential_vars = re.findall(identifier_pattern, expression)
+        
+        for var in potential_vars:
+            var_lower = var.lower()
+            # Filter out keywords, intrinsics, and numeric literals
+            if (var_lower not in fortran_intrinsics_and_keywords and
+                not var_lower.isdigit() and
+                not re.match(r'^\d', var_lower)):
+                # Take only the base name of a derived type access (e.g., 'my_type' from 'my_type%component')
+                base_var = var.split('%')[0]
+                variables.add(base_var.lower())
+                
+        return variables
+    
     def correlate_call_arguments(self, call_info: CallInfo, called_proc_info: ProcedureInfo) -> List[Tuple[str, str, str]]:
         """
         Correlate actual arguments in a call with dummy arguments in procedure definition.
@@ -1146,9 +1280,9 @@ class FortranVariableAnalyzer:
             
             self.file_procedures[filename] = updated_procedures
 
-    def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto'):
+    def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto', show_all_modules: bool = False):
         """Generate comprehensive analysis report with procedure-level analysis"""
-        
+              
         # Infer argument intents before generating the report
         self._infer_argument_intents()
 
@@ -1186,7 +1320,7 @@ class FortranVariableAnalyzer:
             self._generate_global_hotspot_summary(add_line, use_color)
 
         # Global Variables Summary
-        self._generate_global_summary(add_line, show_all_globals, use_color)
+        self._generate_global_summary(add_line, show_all_globals, use_color, show_all_modules)
 
         # File-by-file analysis with procedure breakdown
         for filename in sorted(self.file_procedures.keys()):
@@ -1303,6 +1437,7 @@ class FortranVariableAnalyzer:
                             vars_list = self.procedure_variables[filename][proc.name]
                             if vars_list:
                                 add_line("Local Variable Declarations:", 2, color=Color.CYAN)
+                                add_line("Info: Scope tags like [LOCAL], [ARGUMENT], [IMPORTED(module)], [GLOBAL] show a variable's origin.", 3, color=Color.CYAN)
                                 limit = 15 if truncate_lists else len(vars_list)
                                 for var_info in vars_list[:limit]:
                                     scope_status = self.classify_variable_scope(var_info.name, filename, proc.name)
@@ -1319,6 +1454,7 @@ class FortranVariableAnalyzer:
                             assignments = self.procedure_assignments[filename][proc.name]
                             if assignments:
                                 add_line("Variable Assignments:", 2, color=Color.CYAN)
+                                add_line("Info: Shows where variables are assigned new values within this procedure.", 3, color=Color.CYAN)
                                 assignment_counts = defaultdict(int)
                                 limit = 15 if truncate_lists else len(assignments)
 
@@ -1417,6 +1553,9 @@ class FortranVariableAnalyzer:
 
         # Call Graph Analysis
         self._generate_call_graph_analysis(add_line, use_color)
+        
+        # --- New Dependency Analysis Section ---
+        self._generate_dependency_analysis(add_line, use_color)
 
         report_text = '\n'.join(report_lines)
 
@@ -1428,6 +1567,52 @@ class FortranVariableAnalyzer:
             cprint(f"Report written to {output_file}", Color.GREEN, force_color=color_mode!='never')
         else:
             print(report_text)
+
+    def _generate_dependency_analysis(self, add_line, use_color: bool):
+        """Generate the dependency analysis section of the report."""
+        add_line()
+        add_line("DEPENDENCY ANALYSIS", color=Color.HEADER)
+        add_line("=" * 50, color=Color.HEADER)
+        add_line("Info: This section analyzes data flow within and between procedures.", 1, color=Color.CYAN)
+        add_line()
+
+        for filename in sorted(self.file_procedures.keys()):
+            add_line(f"File: {Path(filename).name}", 1, color=Color.BLUE)
+            
+            # Procedure Data Flow
+            add_line("Procedure Data Flow:", 2, color=Color.CYAN)
+            add_line("Info: Infers a procedure's interface. 'Inputs' are used before being set, 'Outputs' are set.", 3, color=Color.CYAN)
+            procs = self.procedure_data_flow.get(filename, {})
+            if not procs:
+                add_line("No data flow analysis available for this file.", 3)
+            
+            for proc_name, data_flow in sorted(procs.items()):
+                add_line(f"Procedure: {proc_name}", 3)
+                add_line(f"  Inputs:    {', '.join(data_flow.get('inputs', [])) or 'None'}", 4)
+                add_line(f"  Outputs:   {', '.join(data_flow.get('outputs', [])) or 'None'}", 4)
+                add_line(f"  Internals: {', '.join(data_flow.get('internals', [])) or 'None'}", 4)
+            add_line()
+
+            # Dependency Chains for Critical Variables
+            critical_vars = ['dspec', 'hden', 'h2den', 'cd', 'cdd']
+            add_line("Dependency Chains for Critical Variables:", 2, color=Color.CYAN)
+            add_line("Info: Shows how a variable (left) is derived from others. Read chains from right-to-left.", 3, color=Color.CYAN)
+
+            
+            found_chains = False
+            for var in critical_vars:
+                if var in self.variable_dependencies.get(filename, {}):
+                    chains = self.find_dependency_chains(filename, var)
+                    if chains:
+                        found_chains = True
+                        add_line(f"Chains for '{var}':", 3)
+                        for chain in chains[:5]: # Limit output
+                            add_line(f"  {' -> '.join(reversed(chain))}", 4)
+            
+            if not found_chains:
+                add_line("No dependency chains found for critical variables in this file.", 3)
+            
+            add_line()
 
     def _format_list_in_columns(self, items: List[str], num_columns: int = 4, col_width: int = 22) -> List[str]:
         """Formats a list of strings into a multi-column layout."""
@@ -1565,6 +1750,7 @@ class FortranVariableAnalyzer:
 
         if sorted_hotspots:
             add_line("Top Global Variable Modifiers (Hotspots):", 2, color=Color.WARNING)
+            add_line("Info: Procedures that modify many global variables can have wide-ranging side effects.", 3, color=Color.CYAN)
             for proc_name, count in sorted_hotspots[:5]:
                 add_line(f"{proc_name:<30}: Modifies {count} global variables", 3)
             add_line()
@@ -1584,10 +1770,35 @@ class FortranVariableAnalyzer:
         add_line("-" * 80)
         add_line()
 
-    def _generate_global_summary(self, add_line, show_all_globals: bool, use_color: bool):
+    def _generate_global_summary(self, add_line, show_all_globals: bool, use_color: bool, show_all_modules: bool = False):
         """Generate global variables summary"""
         add_line("GLOBAL VARIABLES SUMMARY", color=Color.HEADER)
         add_line("-" * 50, color=Color.HEADER)
+
+        
+        # Determine which modules to display
+        modules_to_display = self.modules
+
+        if not show_all_modules:
+            used_modules = set()
+            # Collect from file-level USE statements
+            for filename in self.file_procedures.keys():
+                for module_name, _, _ in self.use_statements.get(filename, []):
+                    used_modules.add(module_name.lower())
+            
+            # Collect from procedure-level USE statements
+            for filename in self.file_procedures.keys():
+                for proc_uses in self.procedure_use_statements.get(filename, {}).values():
+                    for module_name, _, _ in proc_uses:
+                        used_modules.add(module_name.lower())
+            
+            modules_to_display = {
+                name: var_list for name, var_list in self.modules.items()
+                if name.lower() in used_modules
+            }
+            add_line("Showing modules relevant to analyzed files. Use --show-all-modules to see all.", color=Color.CYAN)
+        
+
         add_line(f"Total modules found: {len(self.modules)}")
         add_line(f"Total global variables: {len(self.global_variables)}")
 
@@ -1595,9 +1806,10 @@ class FortranVariableAnalyzer:
             add_line("Showing ALL global variables (--show-all-globals specified)", color=Color.CYAN)
         else:
             add_line("Showing first 10 variables per module (use --show-all-globals for complete list)", color=Color.CYAN)
+        add_line("Info: [USED] means read, [MODIFIED] means written to, [UNUSED] means neither in the analyzed files.", color=Color.CYAN)
         add_line()
 
-        for module_name, variables in self.modules.items():
+        for module_name, variables in sorted(modules_to_display.items()):
             location = self.module_locations.get(module_name, 'unknown file')
             add_line(f"Module: {module_name} (in {location}) ({len(variables)} variables)", color=Color.BLUE)
 
@@ -1632,6 +1844,8 @@ class FortranVariableAnalyzer:
         """Generate cross-reference analysis"""
         add_line("CROSS-REFERENCE ANALYSIS", color=Color.HEADER)
         add_line("-" * 30, color=Color.HEADER)
+        add_line("This section provides a codebase-wide summary of global variable usage.", 1, color=Color.CYAN)
+        add_line()
 
         # Collect all assignments and reads from both file and procedure level
         all_assigned_vars = set()
@@ -1680,6 +1894,8 @@ class FortranVariableAnalyzer:
         add_line()
         add_line("CALL GRAPH ANALYSIS (Who calls whom)", color=Color.HEADER)
         add_line("-" * 40, color=Color.HEADER)
+        add_line("Info: [DEFINED] procedures are found in the analyzed files. [EXTERNAL] are called but not found.", 1, color=Color.CYAN)
+        add_line()
 
         # Build a reverse map: called_proc -> [calling_proc1, calling_proc2, ...]
         reverse_call_map = defaultdict(list)
@@ -2051,6 +2267,8 @@ def main():
     # NEW: Variable diary feature
     parser.add_argument('--trace-var', metavar='VARIABLE_NAME',
                        help='Generate a detailed lifecycle report for a specific global variable.')
+    parser.add_argument('--show-all-modules', action='store_true',
+                       help='Show all global variables from all modules, not just those used by the analyzed files.')
 
 
     args = parser.parse_args()
@@ -2124,11 +2342,12 @@ def main():
             args.show_all_globals, 
             args.truncate, 
             args.enhanced,
-            show_only_file=args.show_only_file,
+            args.show_only_file,
             show_only_proc=args.show_only_proc,
             hide_locals=args.hide_locals,
             hide_ok=args.hide_ok,
-            color_mode=args.color
+            color_mode=args.color,
+            show_all_modules=args.show_all_modules
         )
         return 0
         
