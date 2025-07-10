@@ -61,6 +61,7 @@ def cprint(text, color, force_color: bool = False, **kwargs):
 class FortranVariableAnalyzer:
     def __init__(self):
         self.global_variables = {}
+        self.global_variables_by_module = defaultdict(dict) 
         self.modules = defaultdict(list)
         self.module_locations = {}
 
@@ -107,8 +108,14 @@ class FortranVariableAnalyzer:
         lines = content.split('\n')
         
         line_buffer = ""
+        buffer_start_line = 1  # Track where multi-line statements start
+        
         for line_num, line in enumerate(lines, 1):
             clean_original = self.clean_line(line)
+            
+            # Track start of new statement
+            if not line_buffer:
+                buffer_start_line = line_num
             
             # Handle line continuations correctly
             if clean_original.endswith('&'):
@@ -137,16 +144,21 @@ class FortranVariableAnalyzer:
             
             # Only look for globals if we are inside a module
             if current_module:
-                # We are only interested in declarations, not procedure bodies
-                proc_match = re.match(r'^\s*(subroutine|function|contains)', line_lower)
-                if proc_match:
-                    current_module = None # Stop parsing this module
-                    continue
+                # Check if we've hit procedures or type definitions
+                if re.match(r'^\s*(subroutine|function|contains|type\s*::|procedure)', line_lower):
+                    # Don't stop parsing for type definitions
+                    if not re.match(r'^\s*type\s*::', line_lower):
+                        current_module = None
+                        continue
 
-                var_infos = self.parse_variable_declaration(line_clean, line_num, current_module)
+                var_infos = self.parse_variable_declaration(line_clean, buffer_start_line, current_module)
                 for var_info in var_infos:
+                    # Store in both structures
                     if var_info.name not in self.global_variables:
                         self.global_variables[var_info.name] = var_info
+                    
+                    self.global_variables_by_module[current_module][var_info.name] = var_info
+                    
                     if var_info.name not in self.modules[current_module]:
                         self.modules[current_module].append(var_info.name)
 
@@ -470,7 +482,7 @@ class FortranVariableAnalyzer:
                 if current_module and not in_interface_block:
                     for var_info in var_infos:
                         if var_info.name not in self.global_variables:
-                            self.global_variables[var_info.name] = var_info
+                            self.global_variables[var_info.name] = var_info  # Store as single object
                         if var_info.name not in self.modules[current_module]:
                             self.modules[current_module].append(var_info.name)
 
@@ -507,14 +519,33 @@ class FortranVariableAnalyzer:
         result = []
 
         # Skip certain lines that are definitely not declarations
-        if (line_lower.startswith('implicit') or line_lower.startswith('save') or
-            line_lower.startswith('contains') or line_lower.startswith('use') or
-            line_lower.startswith('private') or line_lower.startswith('public') or
-            line_lower.startswith('procedure') or line_lower.startswith('class')):
+        skip_keywords = [
+            'implicit', 'save', 'contains', 'use', 'private', 'public', 
+            'procedure', 'class', 'interface', 'module procedure'
+        ]
+        
+        if any(line_lower.startswith(keyword) for keyword in skip_keywords):
             return result
         
-        # In parse_variable_declaration, add a check to skip interface parameters:
-        if re.match(r'^\s*interface\b', line_lower):
+        # Handle TYPE definitions specially
+        type_def_match = re.match(r'^\s*type\s*::\s*(\w+)', line_lower)
+        if type_def_match:
+            type_name = type_def_match.group(1)
+            result.append(VariableInfo(
+                name=type_name,
+                type='type',
+                kind='',
+                dimensions='',
+                is_parameter=False,
+                is_allocatable=False,
+                initial_value='',
+                module=module,
+                line_num=line_num
+            ))
+            return result
+        
+        # Skip if it's a type definition block start
+        if re.match(r'^\s*type\s+(\w+)', line_lower) and '::' not in line_lower:
             return result
 
         try:
@@ -553,7 +584,7 @@ class FortranVariableAnalyzer:
                         variables = self.parse_variable_list(var_part)
 
                         for var_name, dimensions, initial_value in variables:
-                            if var_name:  # Make sure we have a valid variable name
+                            if var_name and not var_name.isdigit():  # Make sure we have a valid variable name
                                 result.append(VariableInfo(
                                     name=var_name,
                                     type=var_type,
@@ -567,7 +598,7 @@ class FortranVariableAnalyzer:
                                 ))
             # F77-style declaration: type variable_list
             else:
-                f77_type_pattern = r'^\s*(integer|real|double\s+precision|complex|logical|character(?:\s*\*[\s\d\w\(\)]+)?)\s+(.*)'
+                f77_type_pattern = r'^\s*(integer|real|double\s+precision|complex|logical|character(?:\s*\*[\s\d\w\(\)]+)?|type\s*\(\s*\w+\s*\))\s+(.*)'
                 match = re.match(f77_type_pattern, line_clean, re.IGNORECASE)
                 if match:
                     type_part = match.group(1)
@@ -588,6 +619,11 @@ class FortranVariableAnalyzer:
                             kind = kind_match.group(1).strip()
                     elif type_part_lower.startswith('double'):
                         var_type = 'double_precision'
+                    elif type_part_lower.startswith('type'):
+                        # Handle derived type
+                        derived_match = re.match(r'type\s*\(\s*(\w+)\s*\)', type_part_lower)
+                        if derived_match:
+                            var_type = f'type({derived_match.group(1)})'
                     else:
                         type_match = re.match(r'(\w+)', type_part_lower)
                         var_type = type_match.group(1)
@@ -597,7 +633,7 @@ class FortranVariableAnalyzer:
                     
                     variables = self.parse_variable_list(var_part)
                     for var_name, dimensions, initial_value in variables:
-                        if var_name:
+                        if var_name and not var_name.isdigit():
                             result.append(VariableInfo(
                                 name=var_name, type=var_type, kind=kind,
                                 dimensions=dimensions, is_parameter=False,
@@ -802,48 +838,65 @@ class FortranVariableAnalyzer:
         return 'VARIABLE_ASSIGNMENT'
 
     def parse_variable_reads(self, line: str, line_num: int, filename: str) -> List[Tuple[str, int, str]]:
-        """Parse variable reads (usage) from a line with better procedure name handling."""
+        """Parse variable reads (usage) from a line with better filtering."""
         reads = []
         line_clean = line.strip()
         
         # Skip declarations, interface blocks, etc.
-        if not line_clean or re.match(r'^\s*(interface|end\s+interface|contains|implicit|subroutine|function|module|program)', line_clean.lower()):
-            return reads
+        skip_patterns = [
+            r'^\s*(interface|end\s+interface|contains|implicit|subroutine|function|module|program)',
+            r'^\s*(integer|real|logical|character|double\s+precision|type)',
+            r'^\s*::\s*',  # Modern Fortran declaration
+        ]
+        
+        for pattern in skip_patterns:
+            if re.match(pattern, line_clean.lower()):
+                return reads
 
         # For CALL statements, don't count the procedure name as a variable read
         if re.search(r'\bcall\s+\w+', line_clean.lower()):
             # Extract just the part inside the parentheses
-            match = re.search(r'\bcall\s+\w+\s*\((.*)\)', line_clean.lower())
+            match = re.search(r'\bcall\s+\w+\s*\((.*)\)', line_clean, re.IGNORECASE)
             search_text = match.group(1) if match else ""
         # For assignment lines, only look at RHS
-        elif '=' in line_clean and not line_clean.lower().strip().startswith('if'):
+        elif '=' in line_clean and not re.match(r'^\s*if\s*\(', line_clean.lower()):
             # Split on first = to get RHS
-            search_text = line_clean.split('=', 1)[1]
+            parts = line_clean.split('=', 1)
+            if len(parts) == 2:
+                search_text = parts[1]
+            else:
+                search_text = line_clean
         else:
             search_text = line_clean
 
         # Find potential procedure names (anything followed by parentheses)
         proc_pattern = r'\b([a-zA-Z_]\w*)\s*\('
-        proc_names = {match.group(1).lower() for match in re.finditer(proc_pattern, search_text.lower())}
+        proc_names = {match.group(1).lower() for match in re.finditer(proc_pattern, search_text)}
         
-        # Find variable names
-        var_pattern = r'\b([a-zA-Z_]\w*)\b'
+        # Enhanced variable pattern - require at least 2 characters for variable names
+        var_pattern = r'\b([a-zA-Z_]\w+)\b'  # Changed from \w* to \w+ to require at least one additional character
+        
         fortran_keywords = {
-            'if', 'then', 'else', 'endif', 'end', 'do', 'while', 'call', 'exit', 'cycle',
+            'if', 'then', 'else', 'elseif', 'endif', 'end', 'do', 'while', 'call', 'exit', 'cycle',
             'function', 'subroutine', 'return', 'stop', 'print', 'write', 'save',
             'read', 'open', 'close', 'sqrt', 'exp', 'log', 'sin', 'cos', 'tan',
             'abs', 'max', 'min', 'real', 'integer', 'logical', 'character', 'dp',
             'in', 'out', 'inout', 'intent', 'parameter', 'allocatable', 'dimension',
-            'true', 'false', 'and', 'or', 'not', 'eq', 'ne', 'gt', 'lt', 'ge', 'le'
+            'true', 'false', 'and', 'or', 'not', 'eq', 'ne', 'gt', 'lt', 'ge', 'le',
+            'double', 'precision', 'implicit', 'none', 'only', 'use', 'module'
         }
+        
+        # Add single-letter exclusions to avoid false positives
+        single_letter_exclusions = {'i', 'j', 'k', 'l', 'm', 'n', 'x', 'y', 'z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'}
 
         for match in re.finditer(var_pattern, search_text):
             var_name = match.group(1).lower()
 
-            # Skip keywords, procedure names, and obvious non-variables
+            # Skip keywords, procedure names, obvious non-variables, and common single letters
             if (var_name not in fortran_keywords and 
                 var_name not in proc_names and
-                not var_name.isdigit()):
+                not var_name.isdigit() and
+                (len(var_name) > 1 or var_name not in single_letter_exclusions)):
                 reads.append((var_name, line_num, 'VARIABLE_READ'))
 
         return reads
@@ -1680,13 +1733,11 @@ class FortranVariableAnalyzer:
         if actual_var_key is None:
             return f"Variable '{var_name}' not found in global variables."
         
-        
         events = []
         
         try:
-            # Find declaration using the actual key
+            # Find declaration using the actual key - now it's a single object, not a list
             var_info = self.global_variables[actual_var_key]
-
             
             module_location = self.module_locations.get(var_info.module, 'unknown')
             
@@ -1697,15 +1748,15 @@ class FortranVariableAnalyzer:
             event_dict['line'] = var_info.line_num
             event_dict['context'] = f"Module {var_info.module}"
             event_dict['details'] = f"{var_info.type} {var_info.name}"
-                     
+                    
             events.append(event_dict)
- 
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             return f"Error processing variable declaration: {e}"
         
+        # [Rest of the method remains the same...]
         
         # Find all direct reads and writes
         proc_count = 0
@@ -1773,7 +1824,6 @@ class FortranVariableAnalyzer:
                     traceback.print_exc()
                     continue
         
-        
         # Sort events by file and line number
         try:
             events.sort(key=lambda x: (x.get('file', ''), x.get('line', 0)))
@@ -1782,6 +1832,7 @@ class FortranVariableAnalyzer:
             traceback.print_exc()
 
         return self.generate_variable_diary_report(actual_var_key, events)
+
 
     def list_global_variables_matching(self, partial_name: str) -> List[str]:
         """Find global variables that match a partial name (case-insensitive)."""
