@@ -1053,8 +1053,52 @@ class FortranVariableAnalyzer:
         
         return indirect_mods
 
+    def _infer_argument_intents(self):
+        """
+        Iterate through all procedures and infer the intent of arguments
+        if they are not explicitly defined.
+        """
+        for filename, procedures in self.file_procedures.items():
+            updated_procedures = []
+            for proc in procedures:
+                updated_args = []
+                # Only infer for arguments with unknown intent
+                if not any(arg.intent != 'UNKNOWN' for arg in proc.arguments):
+                    proc_assignments = self.procedure_assignments.get(filename, {}).get(proc.name, [])
+                    proc_reads = self.procedure_reads.get(filename, {}).get(proc.name, [])
+                    
+                    assigned_vars = {a.variable.lower() for a in proc_assignments}
+                    read_vars = {r[0].lower() for r in proc_reads}
+
+                    for arg in proc.arguments:
+                        arg_lower = arg.name.lower()
+                        is_written = arg_lower in assigned_vars
+                        is_read = arg_lower in read_vars
+                        
+                        inferred_intent = arg.intent
+                        if inferred_intent == 'UNKNOWN':
+                            if is_written and is_read:
+                                inferred_intent = 'INOUT'
+                            elif is_written:
+                                inferred_intent = 'OUT'
+                            elif is_read:
+                                inferred_intent = 'IN'
+                        
+                        updated_args.append(arg._replace(intent=inferred_intent))
+                else:
+                    # If any argument has an explicit intent, trust the existing parsing
+                    updated_args = proc.arguments
+
+                updated_procedures.append(proc._replace(arguments=updated_args))
+            
+            self.file_procedures[filename] = updated_procedures
+
     def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto'):
         """Generate comprehensive analysis report with procedure-level analysis"""
+        
+        # Infer argument intents before generating the report
+        self._infer_argument_intents()
+
         report_lines = []
         
         if color_mode == 'always':
@@ -1096,6 +1140,13 @@ class FortranVariableAnalyzer:
             # Filtering logic for --show-only-file
             if show_only_file and Path(filename).name not in show_only_file:
                 continue
+
+            # Read the file content to get the lines for intent checking
+            try:
+                with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.read().splitlines()
+            except IOError:
+                lines = [] # If file can't be read, we can't check for explicit intents
 
             add_line(f"FILE ANALYSIS: {Path(filename).name}", color=Color.HEADER)
             add_line("=" * 80, color=Color.HEADER)
@@ -1171,10 +1222,16 @@ class FortranVariableAnalyzer:
                         # Format arguments with intent
                         arg_parts = []
                         for arg in proc.arguments:
-                            intent_str = f"[{arg.intent}]" if arg.intent != 'UNKNOWN' else ""
+                            intent_str = ""
+                            if arg.intent != 'UNKNOWN':
+                                # Add a '*' to indicate inferred intent
+                                is_inferred = arg.intent in ['IN', 'OUT', 'INOUT'] and not re.search(r'intent\s*\(\s*' + arg.intent.lower(), ' '.join(lines[proc.start_line:proc.end_line]), re.IGNORECASE)
+                                inferred_marker = '*' if is_inferred else ''
+                                intent_str = f"[{arg.intent}{inferred_marker}]"
                             arg_parts.append(f"{arg.name}{intent_str}")
                         add_line(f"Arguments: {', '.join(arg_parts)}", 2)
                         add_line()
+
 
                         # Procedure-level USE statements
                         if (filename in self.procedure_use_statements and
