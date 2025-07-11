@@ -59,18 +59,19 @@ def cprint(text, color, force_color: bool = False, **kwargs):
 # Copy the entire FortranVariableAnalyzer class here from your original file
 # (The class definition remains the same)
 class FortranVariableAnalyzer:
-    def __init__(self, show_all_modules=False):
+    def __init__(self, args, show_all_modules=False):
         """
         Initialize analyzer state.
         :param show_all_modules: if True, include all modules in unused-variable reports.
         """
+        self.args = args
         self.show_all_modules = show_all_modules
         self.global_variables = {}
         self.global_variables_by_module = defaultdict(dict) 
         self.modules = defaultdict(list)
         self.module_locations = {}
 
-        # File-level structures
+        # Module-level structures  
         self.file_variables = defaultdict(list)
         self.file_assignments = defaultdict(list)
         self.file_reads = defaultdict(list)
@@ -88,8 +89,8 @@ class FortranVariableAnalyzer:
         self.variable_dependencies = defaultdict(lambda: defaultdict(set))  # filename -> {var: set of vars it depends on}
         self.assignment_chains = defaultdict(lambda: defaultdict(list))     # filename -> {var: list of (line_num, rhs_vars)}
         self.procedure_data_flow = defaultdict(lambda: defaultdict(dict))   # filename -> {proc: {inputs, outputs, internals}}
-        self.rhs_variables = defaultdict(lambda: defaultdict(dict))         # filename -> {line_num: [vars_in_rhs]}
-
+        self.rhs_variables = defaultdict(lambda: defaultdict(list))         # filename -> {line_num: [vars_in_rhs]}
+        self.global_vars = set()                   # all globals found
 
     def scan_directory_for_globals(self, source_dir: Path):
         """
@@ -723,7 +724,10 @@ class FortranVariableAnalyzer:
                             var_type = f'type({derived_match.group(1)})'
                     else:
                         type_match = re.match(r'(\w+)', type_part_lower)
-                        var_type = type_match.group(1)
+                        if type_match:
+                            var_type = type_match.group(1)
+                        else:
+                            var_type = 'unknown'
                         kind_match = re.search(r'\*(\s*\d+)', type_part_lower)
                         if kind_match:
                             kind = kind_match.group(1).strip()
@@ -753,7 +757,7 @@ class FortranVariableAnalyzer:
         # Extract base type
         type_match = re.search(r'\b(integer|real|double\s+precision|complex|logical|character|type)\b', type_part_lower)
         if not type_match:
-            return None, '', ''
+            return 'unknown', '', ''
 
         var_type = type_match.group(1).replace(' ', '_')
 
@@ -1297,7 +1301,7 @@ class FortranVariableAnalyzer:
             
             self.file_procedures[filename] = updated_procedures
 
-    def generate_report(self, output_file: str = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto', show_all_modules: bool = False):
+    def generate_report(self, output_file: Optional[str] = None, show_all_globals: bool = False, truncate_lists: bool = False, enhanced: bool = False, show_only_file: Optional[List[str]] = None, show_only_proc: Optional[List[str]] = None, hide_locals: bool = False, hide_ok: bool = False, color_mode: str = 'auto', show_all_modules: bool = False):
         """Generate comprehensive analysis report with procedure-level analysis"""
               
         # Infer argument intents before generating the report
@@ -1563,6 +1567,21 @@ class FortranVariableAnalyzer:
 
                         add_line()
 
+            add_line()
+
+        # Insert Global-to-Local Refactoring Candidates
+        if self.args.refactor_candidates:
+            candidates = self.find_refactor_candidates()
+            add_line("GLOBAL-TO-LOCAL REFACTORING CANDIDATES:", 0, Color.BLUE)
+            if candidates:
+                for g, (proc, fname, intent) in sorted(candidates.items()):
+                    add_line(
+                        f"Global '{g}' only used in '{proc}' ({fname}) with intent={intent}. "
+                        f"Suggest passing as INTENT({intent}) parameter.",
+                        1
+                    )
+            else:
+                add_line("No globals found that are used by a single procedure.", 1)
             add_line()
 
         # Cross-reference analysis
@@ -2256,7 +2275,49 @@ class FortranVariableAnalyzer:
                     loc = f"{mod} (declared line {varinfo.line_num})"
                     print(f"[UNUSED GLOBAL] {varname} in module {loc}")
 
+    def find_refactor_candidates(self):
+        """
+        Identify globals used by exactly one procedure (case-insensitive), determine read/write intent,
+        and suggest passing them as arguments with appropriate INTENT.
 
+        Returns:
+            Dict[str, Tuple[str, str, str]]: mapping of global name to (procedure, filename, intent).
+        """
+        # Map lowercase globals to their original names for case-insensitive matching
+        global_lower_map = {name.lower(): name for name in self.global_variables}
+        # Build usage map: global_name -> set of "proc@file"
+        global_users = defaultdict(set)
+        for fname, proc_map in self.procedure_reads.items():
+            for proc, reads in proc_map.items():
+                for var_name, _, _ in reads:
+                    key = f"{proc}@{fname}"
+                    lower = var_name.lower()
+                    if lower in global_lower_map:
+                        global_users[global_lower_map[lower]].add(key)
+        for fname, proc_map in self.procedure_assignments.items():
+            for proc, assigns in proc_map.items():
+                for a in assigns:
+                    key = f"{proc}@{fname}"
+                    lower = a.variable.lower()
+                    if lower in global_lower_map:
+                        global_users[global_lower_map[lower]].add(key)
+
+        candidates = {}
+        for g, users in global_users.items():
+            if len(users) == 1:
+                user = next(iter(users))
+                proc, fname = user.split('@', 1)
+                reads = [v.lower() for v, _, _ in self.procedure_reads.get(fname, {}).get(proc, [])]
+                writes = [a.variable.lower() for a in self.procedure_assignments.get(fname, {}).get(proc, [])]
+                # Determine intent
+                if g.lower() in reads and g.lower() in writes:
+                    intent = 'INOUT'
+                elif g.lower() in reads:
+                    intent = 'IN'
+                else:
+                    intent = 'OUT'
+                candidates[g] = (proc, fname, intent)
+        return candidates
 
     def classify_variable_scope(self, var_name: str, filename: str, proc_name: Optional[str] = None) -> str:
         """Enhanced scope classification"""
@@ -2441,7 +2502,10 @@ def main():
                        help='Generate a detailed lifecycle report for a specific global variable.')
     parser.add_argument('--show-all-modules', action='store_true',
                        help='Show all global variables from all modules, not just those used by the analyzed files.')
-
+    parser.add_argument('--refactor-candidates',
+        action='store_true',
+        help='Suggest globals that can be passed as procedure arguments with INTENT annotations.'
+    )
 
     args = parser.parse_args()
     
@@ -2466,7 +2530,7 @@ def main():
         return 1
     
     # Initialize analyzer and run analysis (existing code)
-    analyzer = FortranVariableAnalyzer(show_all_modules=args.show_all_modules)
+    analyzer = FortranVariableAnalyzer(args, show_all_modules=args.show_all_modules)
     analyzer.scan_directory_for_globals(codebase_path)
     
     
