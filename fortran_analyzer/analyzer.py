@@ -59,7 +59,12 @@ def cprint(text, color, force_color: bool = False, **kwargs):
 # Copy the entire FortranVariableAnalyzer class here from your original file
 # (The class definition remains the same)
 class FortranVariableAnalyzer:
-    def __init__(self):
+    def __init__(self, show_all_modules=False):
+        """
+        Initialize analyzer state.
+        :param show_all_modules: if True, include all modules in unused-variable reports.
+        """
+        self.show_all_modules = show_all_modules
         self.global_variables = {}
         self.global_variables_by_module = defaultdict(dict) 
         self.modules = defaultdict(list)
@@ -202,8 +207,14 @@ class FortranVariableAnalyzer:
         proc_start_line = 0
 
         # This regex handles multi-line arguments
-        proc_regex = re.compile(r'^\s*(subroutine|function)\s+([a-zA-Z_]\w*)\s*(?:\((.*?)\))?', re.IGNORECASE | re.DOTALL)
-
+        # Allow an optional type keyword (e.g. "real function") before function/subroutine
+        proc_regex = re.compile(
+            r'^\s*(?:\w+\s+)?'                    # optional type specifier
+            r'(subroutine|function)\s+'           # proc kind
+            r'([A-Za-z_]\w*)\s*'                  # name
+            r'(?:\((.*?)\))?',                    # args
+            re.IGNORECASE | re.DOTALL
+        )
         for i, line in enumerate(lines, 1):
             line_clean = self.clean_line(line)
             line_lower = line_clean.lower()
@@ -234,11 +245,14 @@ class FortranVariableAnalyzer:
             if in_interface_block:
                 continue
 
-            # Handle procedure definitions with continuations
-            if not in_procedure_def and re.match(r'^\s*(subroutine|function)\s+([a-zA-Z_]\w*)', line_clean, re.IGNORECASE):
-                in_procedure_def = True
-                proc_start_line = i
-                proc_buffer = line_clean.rstrip('&').rstrip()
+            # Handle procedure definitions with continuations (catch both bare and typed functions)
+            if not in_procedure_def:
+                sub_m = re.match(r'^\s*subroutine\s+([A-Za-z_]\w*)', line_clean, re.IGNORECASE)
+                func_m = re.match(r'^\s*(?:\w+\s+)*function\s+([A-Za-z_]\w*)', line_clean, re.IGNORECASE)
+                if sub_m or func_m:
+                    in_procedure_def = True
+                    proc_start_line = i
+                    proc_buffer = line_clean.rstrip('&').rstrip()
             elif in_procedure_def and line_clean.strip():
                 # Append continued lines
                 proc_buffer += ' ' + line_clean.lstrip('&').strip()
@@ -936,9 +950,12 @@ class FortranVariableAnalyzer:
         
         # Skip declarations, interface blocks, etc.
         skip_patterns = [
-            r'^\s*(interface|end\s+interface|contains|implicit|subroutine|function|module|program)',
-            r'^\s*(integer|real|logical|character|double\s+precision|type)',
-            r'^\s*::\s*',  # Modern Fortran declaration
+        # Skip declaration lines
+        r'^\s*(interface|end\s+interface|contains|implicit|subroutine|function|module|program)',
+        r'^\s*(integer|real|logical|character|double\s+precision|type)',
+        r'^\s*::\s*',
+        # Skip I/O statements entirely
+        r'^\s*(write|print|read)\b',
         ]
         
         for pattern in skip_patterns:
@@ -1770,75 +1787,96 @@ class FortranVariableAnalyzer:
         add_line("-" * 80)
         add_line()
 
-    def _generate_global_summary(self, add_line, show_all_globals: bool, use_color: bool, show_all_modules: bool = False):
+    def _generate_global_summary(self,
+                                 add_line,
+                                 show_all_globals: bool,
+                                 use_color: bool,
+                                 show_all_modules: bool = False):
         """Generate global variables summary"""
         add_line("GLOBAL VARIABLES SUMMARY", color=Color.HEADER)
         add_line("-" * 50, color=Color.HEADER)
 
-        
         # Determine which modules to display
-        modules_to_display = self.modules
-
         if not show_all_modules:
             used_modules = set()
-            # Collect from file-level USE statements
-            for filename in self.file_procedures.keys():
-                for module_name, _, _ in self.use_statements.get(filename, []):
-                    used_modules.add(module_name.lower())
-            
-            # Collect from procedure-level USE statements
-            for filename in self.file_procedures.keys():
-                for proc_uses in self.procedure_use_statements.get(filename, {}).values():
-                    for module_name, _, _ in proc_uses:
-                        used_modules.add(module_name.lower())
-            
+            # file-level USEs
+            for fname in self.file_procedures.keys():
+                for mod, _, _ in self.use_statements.get(fname, []):
+                    used_modules.add(mod.lower())
+            # proc-level USEs
+            for fname in self.procedure_use_statements:
+                for proc_uses in self.procedure_use_statements[fname].values():
+                    for mod, _, _ in proc_uses:
+                        used_modules.add(mod.lower())
+
             modules_to_display = {
-                name: var_list for name, var_list in self.modules.items()
+                name: vars_list
+                for name, vars_list in self.modules.items()
                 if name.lower() in used_modules
             }
-            add_line("Showing modules relevant to analyzed files. Use --show-all-modules to see all.", color=Color.CYAN)
-        
+            add_line("Showing modules relevant to analyzed files. "
+                     "Use --show-all-modules to see all.",
+                     color=Color.CYAN)
+        else:
+            modules_to_display = self.modules
 
         add_line(f"Total modules found: {len(self.modules)}")
         add_line(f"Total global variables: {len(self.global_variables)}")
 
         if show_all_globals:
-            add_line("Showing ALL global variables (--show-all-globals specified)", color=Color.CYAN)
+            add_line("Showing ALL global variables (--show-all-globals specified)",
+                     color=Color.CYAN)
         else:
-            add_line("Showing first 10 variables per module (use --show-all-globals for complete list)", color=Color.CYAN)
-        add_line("Info: [USED] means read, [MODIFIED] means written to, [UNUSED] means neither in the analyzed files.", color=Color.CYAN)
+            add_line("Showing first 10 variables per module "
+                     "(use --show-all-globals for complete list)",
+                     color=Color.CYAN)
+        add_line("Info: [USED] means read, [MODIFIED] means written to, "
+                 "[UNUSED] means neither in the analyzed files.",
+                 color=Color.CYAN)
         add_line()
 
+        # Per-module listing
         for module_name, variables in sorted(modules_to_display.items()):
             location = self.module_locations.get(module_name, 'unknown file')
-            add_line(f"Module: {module_name} (in {location}) ({len(variables)} variables)", color=Color.BLUE)
+            add_line(f"Module: {module_name} (in {location}) "
+                     f"({len(variables)} variables)",
+                     color=Color.BLUE)
 
-            # Show all variables if requested, otherwise limit to 10
+            # Decide how many to show
             display_vars = variables if show_all_globals else variables[:10]
 
-            # Count usage statistics for this module
+            # Counters for strict matches only
             used_count = 0
             modified_count = 0
 
             for var_name in display_vars:
                 if var_name in self.global_variables:
-                    var_info = self.global_variables[var_name]
+                    var_info     = self.global_variables[var_name]
                     usage_status = self._check_global_variable_usage(var_name)
-                    line_str = self._format_variable_line(var_info, usage_status, use_color)
+                    line_str     = self._format_variable_line(var_info,
+                                                             usage_status,
+                                                             use_color)
                     add_line(line_str, 1)
 
-                    if "USED" in usage_status:
+                    # Only exact matches
+                    if usage_status in ("USED", "USED+MODIFIED"):
                         used_count += 1
-                    if "MODIFIED" in usage_status:
+                    if usage_status in ("MODIFIED", "USED+MODIFIED"):
                         modified_count += 1
 
+            # Indicate there are more if truncated
             if not show_all_globals and len(variables) > 10:
-                add_line(f"  ... and {len(variables) - 10} more variables (use --show-all-globals to see all)", 1, color=Color.CYAN)
+                add_line(f"  ... and {len(variables) - 10} more variables "
+                         "(use --show-all-globals to see all)",
+                         1, color=Color.CYAN)
 
-            # Add module usage summary
-            usage_pct = (used_count / len(display_vars)) * 100 if display_vars else 0
-            add_line(f"  Module Usage: {used_count}/{len(display_vars)} variables used ({usage_pct:.1f}%), {modified_count} modified", 1)
+            # Summary line with percentage
+            pct = (used_count / len(display_vars) * 100) if display_vars else 0.0
+            add_line(f"  Module Usage: {used_count}/{len(display_vars)} "
+                     f"variables used ({pct:.1f}%), {modified_count} modified",
+                     1)
             add_line()
+
 
     def _generate_cross_reference_analysis(self, add_line, use_color: bool):
         """Generate cross-reference analysis"""
@@ -2102,6 +2140,123 @@ class FortranVariableAnalyzer:
                 lines.append("")
         
         return '\n'.join(lines)
+    
+    def optimize_use_statements(self):
+        """
+        Enhanced USE optimizer: for each USE statement, scans *all* code lines
+        after that point for any identifier, then filters to the module’s exports.
+        """
+        # Build a per-file token cache on first run
+        if not hasattr(self, "_token_index"):
+            self._token_index = {}
+            for fname in self.use_statements:
+                try:
+                    with open(fname, 'r') as f:
+                        lines = f.readlines()
+                except IOError:
+                    continue
+                token_list = []
+                for lineno, line in enumerate(lines, start=1):
+                    for tok in re.findall(r'\b([A-Za-z_]\w*)\b', line):
+                        token_list.append((tok.lower(), lineno))
+                self._token_index[fname] = token_list
+
+        def _gather_all_identifiers(fname, start_line):
+            used = set()
+            for tok, ln in self._token_index.get(fname, []):
+                if ln >= start_line:
+                    used.add(tok)
+            return used
+
+        # Rewrite file-level USEs in-place
+        for fname, uses in self.use_statements.items():
+            updated = []
+            for module_name, old_only, lineno in uses:
+                # lowercase export names
+                exports = {v.lower() for v in self.global_variables_by_module.get(module_name, {})}
+                seen    = _gather_all_identifiers(fname, lineno)
+                actually = sorted(exports & seen)
+
+                suggestion = (f"use {module_name}, only: {', '.join(actually)}"
+                              if actually else f"! no references to {module_name}")
+                print(f"{fname}:{lineno}: {suggestion}")
+
+                # persist for later reporting
+                new_only = ", ".join(actually) if actually else ""
+                updated.append((module_name, new_only or 'all', lineno))
+
+            self.use_statements[fname] = updated
+
+        # And do the same for procedure-level USEs
+        for fname, procs in self.procedure_use_statements.items():
+            for proc_name, uses in procs.items():
+                updated = []
+                for module_name, old_only, lineno in uses:
+                    exports = {v.lower() for v in self.global_variables_by_module.get(module_name, {})}
+                    seen    = _gather_all_identifiers(fname, lineno)
+                    actually = sorted(exports & seen)
+
+                    suggestion = (f"use {module_name}, only: {', '.join(actually)}"
+                                  if actually else f"! no references to {module_name}")
+                    print(f"{fname}:{lineno} ({proc_name}): {suggestion}")
+
+                    new_only = ", ".join(actually) if actually else ""
+                    updated.append((module_name, new_only or 'all', lineno))
+
+                self.procedure_use_statements[fname][proc_name] = updated
+
+
+
+
+    def suggest_intent_annotations(self):
+        """
+        For each parsed procedure, infer INTENT(IN/OUT/INOUT) only if
+        no INTENT was declared already on that dummy argument.
+        """
+        for fname, procs in self.file_procedures.items():
+            for proc in procs:
+                # your existing data-flow for this proc
+                df = self.procedure_data_flow[fname].get(proc.name, {})
+                inputs  = set(df.get('inputs', []))
+                outputs = set(df.get('outputs', []))
+
+                for arg in proc.arguments:
+                    # ---- NEW: skip if intent already declared ----
+                    if getattr(arg, 'intent', None) is not None:
+                        continue
+
+                    name = arg.name.lower()
+                    if name in inputs and name in outputs:
+                        intent = 'INOUT'
+                    elif name in outputs:
+                        intent = 'OUT'
+                    elif name in inputs:
+                        intent = 'IN'
+                    else:
+                        continue  # never used
+                    print(f"{fname}:{proc.start_line}  ➤  In {proc.name}(), "
+                          f"argument '{arg.name}' should be INTENT({intent})")
+
+
+    def report_unused_variables(self):
+        """
+        Scan all globals and flag those never used,
+        skipping unused modules unless show_all_modules is True.
+        """
+        # precompute modules actually used
+        used_mods = set(self.use_statements.keys()) | set(self.procedure_use_statements.keys())
+
+        for mod, vars_dict in self.global_variables_by_module.items():
+            if not self.show_all_modules and mod not in used_mods:
+                continue
+
+            for varname, varinfo in vars_dict.items():
+                usage = self._check_global_variable_usage(varname)
+                if usage == 'UNUSED':
+                    loc = f"{mod} (declared line {varinfo.line_num})"
+                    print(f"[UNUSED GLOBAL] {varname} in module {loc}")
+
+
 
     def classify_variable_scope(self, var_name: str, filename: str, proc_name: Optional[str] = None) -> str:
         """Enhanced scope classification"""
@@ -2172,62 +2327,79 @@ class FortranVariableAnalyzer:
 
         return "UNKNOWN"
 
-    def _check_global_variable_usage(self, var_name: str) -> str:
-        """Check if a global variable is used in any analyzed file"""
-        var_lower = var_name.lower()
+    def _check_global_variable_usage(self, varname: str) -> str:
+        """
+        Determine usage status for a global variable:
+          - 'UNUSED' if never seen
+          - 'USED' if read (or appears in any token index)
+          - 'MODIFIED' if written to
+          - 'USED+MODIFIED' if both read and written
+        """
+        target = varname.lower()
+        used = False
+        modified = False
 
-        # Check if variable is read (file-level and procedure-level)
-        is_read = False
-        for reads in self.file_reads.values():
-            for read_var, _, _ in reads:
-                if read_var.lower() == var_lower:
-                    is_read = True
+        # 1) File-level reads
+        for fname, reads in self.file_reads.items():
+            for v, _, _ in reads:
+                if v.lower() == target:
+                    used = True
                     break
-            if is_read:
+            if used:
                 break
 
-        if not is_read:
-            for filename_procedures in self.procedure_reads.values():
-                for procedure_reads in filename_procedures.values():
-                    for read_var, _, _ in procedure_reads:
-                        if read_var.lower() == var_lower:
-                            is_read = True
-                            break
-                    if is_read:
-                        break
-                if is_read:
+        # 2) File-level writes
+        for fname, assigns in self.file_assignments.items():
+            for a in assigns:
+                if a.variable.lower() == target:
+                    modified = True
                     break
-
-        # Check if variable is assigned (file-level and procedure-level)
-        is_assigned = False
-        for assignments in self.file_assignments.values():
-            for assignment in assignments:
-                if assignment.variable.lower() == var_lower:
-                    is_assigned = True
-                    break
-            if is_assigned:
+            if modified:
                 break
 
-        if not is_assigned:
-            for filename_procedures in self.procedure_assignments.values():
-                for procedure_assignments in filename_procedures.values():
-                    for assignment in procedure_assignments:
-                        if assignment.variable.lower() == var_lower:
-                            is_assigned = True
+        # 3) Procedure-level reads
+        if not used:
+            for fname, procs in self.procedure_reads.items():
+                for proc_name, reads in procs.items():
+                    for v, _, _ in reads:
+                        if v.lower() == target:
+                            used = True
                             break
-                    if is_assigned:
+                    if used:
                         break
-                if is_assigned:
+                if used:
                     break
 
-        if is_read and is_assigned:
+        # 4) Procedure-level writes
+        if not modified:
+            for fname, procs in self.procedure_assignments.items():
+                for proc_name, assigns in procs.items():
+                    for a in assigns:
+                        if a.variable.lower() == target:
+                            modified = True
+                            break
+                    if modified:
+                        break
+                if modified:
+                    break
+
+        # 5) Fallback: any appearance in token index (declarations, kind, PARAMETER, dims)
+        if not used and not modified and hasattr(self, "_token_index"):
+            for fname, tokens in self._token_index.items():
+                if any(tok == target for tok, _ in tokens):
+                    used = True
+                    break
+
+        # 6) Return combined status
+        if used and modified:
             return "USED+MODIFIED"
-        elif is_read:
-            return "USED"
-        elif is_assigned:
+        elif modified:
             return "MODIFIED"
+        elif used:
+            return "USED"
         else:
             return "UNUSED"
+
 
 def main():
     """Main entry point for the command line interface"""
@@ -2294,8 +2466,9 @@ def main():
         return 1
     
     # Initialize analyzer and run analysis (existing code)
-    analyzer = FortranVariableAnalyzer()
+    analyzer = FortranVariableAnalyzer(show_all_modules=args.show_all_modules)
     analyzer.scan_directory_for_globals(codebase_path)
+    
     
     analyzed_count = 0
     cprint("\nStarting detailed analysis...", Color.BOLD, force_color=args.color=='always')
@@ -2314,7 +2487,12 @@ def main():
         return 1
     
     cprint(f"\nSuccessfully analyzed {analyzed_count}/{len(analysis_targets)} files", Color.GREEN, force_color=args.color=='always')
-    
+
+    if args.enhanced:
+        analyzer.optimize_use_statements()
+        analyzer.suggest_intent_annotations()
+        analyzer.report_unused_variables()
+
     # NEW: Handle variable diary request
     if args.trace_var:
         try:
